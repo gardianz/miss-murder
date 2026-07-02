@@ -1,0 +1,4 @@
+# Daftar proxy (satu per baris). Salin ke ~/.proxies.txt lalu isi proxy asli.
+# Format: http://user:pass@host:port
+http://user:pass@1.2.3.4:8000
+http://user:pass@5.6.7.8:8000

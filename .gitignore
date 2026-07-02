@@ -1,0 +1,36 @@
+# ═══ DATA SENSITIF — JANGAN PERNAH COMMIT ═══
+# private key + cookie sesi semua akun (akses aset EDELx nyata)
+accounts.json
+accounts*.json
+*.bak.json
+*.bak2
+*.bak
+party_ids.csv
+# proxy dengan kredensial
+.proxies.txt
+proxies.txt
+# lock & temp state
+*.lock
+*.tmp
+
+# ═══ log & runtime ═══
+*.log
+register_*.log
+
+# ═══ dependency / cache ═══
+node_modules/
+engine/node_modules/
+__pycache__/
+*.pyc
+.playwright-mcp/
+.claude/
+
+# ═══ engine debug/sniff (legacy investigasi, tak perlu di repo) ═══
+engine/sniff*.js
+engine/debug_*.js
+engine/dbg.js
+engine/test_*.js
+
+# scratch
+/tmp/
+*.orig
