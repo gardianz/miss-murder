@@ -37,16 +37,21 @@ LOG = []                                                  # activity log
 SEL = 0                                                   # index akun terpilih di dashboard
 
 def _read_key(timeout=0.15):
-    """Baca 1 keypress non-blocking. Return 'up'|'down'|'q'|char|None."""
+    """Baca 1 keypress non-blocking. Return 'up'|'down'|'q'|char|None.
+    Panah = ESC '[' 'A'/'B' (3 byte, bisa datang terpisah) — baca sisa dgn sabar biar tak salah keluar."""
     r, _, _ = select.select([sys.stdin], [], [], timeout)
     if not r: return None
     ch = sys.stdin.read(1)
     if ch == "\x1b":
-        r2, _, _ = select.select([sys.stdin], [], [], 0.02)
-        if r2:
-            seq = sys.stdin.read(2)
-            return {"[A": "up", "[B": "down"}.get(seq, "esc")
-        return "esc"
+        seq = ""
+        for _ in range(2):  # baca maksimal 2 byte sisa escape sequence
+            r2, _, _ = select.select([sys.stdin], [], [], 0.12)
+            if not r2: break
+            seq += sys.stdin.read(1)
+        if seq == "[A": return "up"
+        if seq == "[B": return "down"
+        if seq == "": return "esc"   # ESC murni -> keluar
+        return None                   # sequence lain (kiri/kanan/dll) -> ABAIKAN, jangan keluar
     return ch
 
 def logline(msg):
