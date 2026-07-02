@@ -8,7 +8,7 @@ usage:
   python3 edel_cli.py            # menu interaktif
   python3 edel_cli.py dash       # langsung dashboard live
 """
-import sys, time, threading, datetime as dt, termios, tty, select
+import sys, os, time, threading, datetime as dt, termios, tty, select
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import listing_bot as LB
@@ -37,22 +37,19 @@ LOG = []                                                  # activity log
 SEL = 0                                                   # index akun terpilih di dashboard
 
 def _read_key(timeout=0.15):
-    """Baca 1 keypress non-blocking. Return 'up'|'down'|'q'|char|None.
-    Panah = ESC '[' 'A'/'B' (3 byte, bisa datang terpisah) — baca sisa dgn sabar biar tak salah keluar."""
-    r, _, _ = select.select([sys.stdin], [], [], timeout)
+    """Baca keypress non-blocking via os.read (RAW fd — hindari buffering sys.stdin yang bikin
+    panah salah-baca). Panah dikirim terminal sbg 3 byte atomik b'\\x1b[A'. Return 'up'|'down'|'q'|char|None."""
+    fd = sys.stdin.fileno()
+    r, _, _ = select.select([fd], [], [], timeout)
     if not r: return None
-    ch = sys.stdin.read(1)
-    if ch == "\x1b":
-        seq = ""
-        for _ in range(2):  # baca maksimal 2 byte sisa escape sequence
-            r2, _, _ = select.select([sys.stdin], [], [], 0.12)
-            if not r2: break
-            seq += sys.stdin.read(1)
-        if seq == "[A": return "up"
-        if seq == "[B": return "down"
-        if seq == "": return "esc"   # ESC murni -> keluar
-        return None                   # sequence lain (kiri/kanan/dll) -> ABAIKAN, jangan keluar
-    return ch
+    try: data = os.read(fd, 8)  # cukup untuk escape sequence terpanjang
+    except OSError: return None
+    if data in (b"\x1b[A", b"\x1bOA"): return "up"
+    if data in (b"\x1b[B", b"\x1bOB"): return "down"
+    if data in (b"q", b"Q"): return "q"
+    if data == b"\x03": return "\x03"     # Ctrl-C
+    if data == b"\x1b": return "esc"       # ESC murni
+    return None                             # apa pun lain -> ABAIKAN (jangan keluar)
 
 def logline(msg):
     LOG.append(f"{dt.datetime.now():%H:%M:%S} {msg}")
