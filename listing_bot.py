@@ -329,10 +329,11 @@ def auto_loop(accts, workers=8, poll_slow=None, poll_fast=None, log=print, stop=
     ada 'locked', lambat saat idle). KEBAL (tiap iterasi try). stop=Event untuk berhenti bersih."""
     global _ACCTS
     poll_slow = poll_slow if poll_slow is not None else int(os.environ.get("AUTO_POLL", "180"))
-    poll_fast = poll_fast if poll_fast is not None else int(os.environ.get("AUTO_POLL_FAST", "45"))
+    poll_fast = poll_fast if poll_fast is not None else int(os.environ.get("AUTO_POLL_FAST", "25"))
+    hard_retry = int(os.environ.get("HARD_RETRY", "6"))  # retry LANGSUNG akun fail/no_session per siklus
     last_win = None
     AUTO_STATE["running"] = True
-    log(f"[auto] mulai — poll adaptif {poll_fast}s/{poll_slow}s.")
+    log(f"[auto] mulai — poll adaptif {poll_fast}s/{poll_slow}s, hard-retry {hard_retry}x.")
     while not (stop and stop.is_set()):
         wait = poll_slow
         try:
@@ -343,18 +344,30 @@ def auto_loop(accts, workers=8, poll_slow=None, poll_fast=None, log=print, stop=
                 log(f"[auto] === WINDOW BARU {wid[11:16]} (server {(snow or '')[11:19]}) ===")
                 last_win = wid
             res = run_all(accts, workers=workers, log=log, stop=stop)
+            # RETRY LANGSUNG: akun yang GAGAL jaringan / sesi (bukan locked/no_edelx) — ini yang HARUS ikut.
+            # Ulang terus dalam siklus ini sampai bersih atau batas hard_retry (jeda pendek antar percobaan).
+            for rp in range(hard_retry):
+                bad = [e for e, s in res.items() if s in ("fail", "no_session")]
+                if not bad or (stop and stop.is_set()): break
+                log(f"[auto] retry-langsung {len(bad)} akun gagal (percobaan {rp+1}/{hard_retry})")
+                time.sleep(2)
+                res.update(run_all(accts, emails=set(bad), workers=workers, log=log, stop=stop))
             c = {}
             for v in res.values(): c[v] = c.get(v, 0) + 1
             submitted, locked, fail = c.get("submitted", 0), c.get("locked", 0), c.get("fail", 0)
             AUTO_STATE["total_submitted"] += submitted
             AUTO_STATE.update(submitted=submitted, locked=locked, fail=fail,
                               no_edelx=c.get("no_edelx", 0), already=c.get("already", 0), last=time.time())
+            # partisipasi: sudah ikut window ini = submitted + already ; belum = locked (nunggu settle) + fail sisa
+            joined = submitted + c.get("already", 0)
+            waiting = locked + c.get("pending", 0)
             if submitted: log(f"[auto] window {(wid or '')[11:16]}: +{submitted} submit (total {AUTO_STATE['total_submitted']})")
-            # poll CEPAT kalau ada yang perlu diulang: locked (nunggu settlement) / fail (proxy err) / no_session
+            log(f"[auto] partisipasi window {(wid or '')[11:16]}: ikut={joined} nunggu-settle={waiting} gagal-sisa={fail} belum-deposit={c.get('no_edelx',0)}")
+            # poll CEPAT selama masih ada yang bisa diulang (locked nunggu settle / fail / no_session / pending)
             retry = locked + fail + c.get("no_session", 0) + c.get("pending", 0)
             wait = poll_fast if retry > 0 else poll_slow
-            if fail: log(f"[auto] {fail} akun gagal (proxy/jaringan) → ULANG {wait}s")
-            if locked: log(f"[auto] {locked} akun menunggu settlement → cek lagi {wait}s")
+            if fail: log(f"[auto] {fail} akun MASIH gagal setelah hard-retry → ULANG {wait}s")
+            if locked: log(f"[auto] {locked} akun menunggu settlement server → cek lagi {wait}s")
         except Exception as e:
             log(f"[auto] err: {str(e)[:90]}"); wait = poll_fast
         # tidur interruptible (Ctrl-C / stop langsung berhenti)
