@@ -352,6 +352,8 @@ def do_listing(acct, accts, rankmap, log=print):
     # SINYAL PASTI sudah-submit: round.decisions sudah punya pickedAssetId (bukan sekadar 'no preview').
     rnd = lr.get("round") or {}
     decs = rnd.get("decisions") or []
+    if rnd.get("status") == "FAILED":  # picks tersubmit tapi stake-lock GAGAL di server; stake dikembalikan.
+        log(f"[{em}] round FAILED di server (stake dikembalikan) — server tolak submit ulang, ikut window berikut"); return "failed_round"
     if decs and all(d.get("pickedAssetId") for d in decs):
         log(f"[{em}] SKIP: sudah submit window ini (status {rnd.get('status')})"); return "already"
     if reason in _R_DONE:
@@ -431,11 +433,12 @@ def auto_loop(accts, workers=8, poll_slow=None, poll_fast=None, log=print, stop=
             joined = submitted + c.get("already", 0)
             waiting = locked + c.get("pending", 0)
             if submitted: log(f"[auto] window {(wid or '')[11:16]}: +{submitted} submit (total {AUTO_STATE['total_submitted']})")
-            ck = c.get("cookie_expired", 0)
+            ck = c.get("cookie_expired", 0); fr = c.get("failed_round", 0)
             log(f"[auto] partisipasi window {(wid or '')[11:16]}: ikut={joined} nunggu-settle={waiting} gagal-sisa={fail} belum-deposit={c.get('no_edelx',0)}"
-                + (f" cookie-mati={ck}" if ck else ""))
-            # poll CEPAT selama masih ada yang bisa diulang (locked nunggu settle / fail / no_session / pending)
-            retry = locked + fail + c.get("no_session", 0) + c.get("pending", 0)
+                + (f" round-gagal-server={fr}" if fr else "") + (f" cookie-mati={ck}" if ck else ""))
+            if fr: log(f"[auto] {fr} akun round FAILED di server (stake balik, tak bisa submit ulang window ini) → ikut window berikut")
+            # poll CEPAT selama masih ada yang bisa diulang (locked nunggu settle / fail / no_session / pending / round-gagal)
+            retry = locked + fail + c.get("no_session", 0) + c.get("pending", 0) + fr
             wait = poll_fast if retry > 0 else poll_slow
             if fail: log(f"[auto] {fail} akun MASIH gagal setelah hard-retry → ULANG {wait}s")
             if locked: log(f"[auto] {locked} akun menunggu settlement server → cek lagi {wait}s")
