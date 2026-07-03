@@ -226,11 +226,11 @@ def phase_from(lr, edelx):
     prev = lr.get("preview")
     snow = lr.get("serverTime")
     closes = (rnd.get("timing") or (lr.get("currentWindow", {}) or {}).get("timing") or {}).get("selectionClosesAt")
-    staked = units(edelx.get("staked")) if edelx else 0
+    staked = (units(edelx.get("staked")) + units(edelx.get("locked"))) if edelx else 0  # locked = masih dlm settlement
     status = rnd.get("status")
     lock = rnd.get("stakeLockStatus")
     if status == "SUBMITTED":
-        if staked <= 0:               # stake sudah lepas → settlement selesai
+        if staked <= 0:               # stake+locked sudah lepas → settlement selesai
             return "final"
         if lock and lock != "locked":  # submit tapi belum ter-lock penuh
             return "allocation_pending"
@@ -268,10 +268,12 @@ def do_listing(acct, accts, rankmap, log=print):
         log(f"[{em}] SKIP: portfolio tak terbaca ({st})"); return "fail"
     edelx = next((b for b in pf.get("balances", []) if b.get("instrumentId") == "EDELx"), None)
     avail = units(edelx.get("available")) if edelx else 0
-    total = units(edelx.get("total")) if edelx else 0
+    locked_amt = units(edelx.get("locked")) if edelx else 0
+    staked_amt = units(edelx.get("staked")) if edelx else 0
+    held = avail + locked_amt + staked_amt  # total holding SEBENARNYA (server 'total' TIDAK termasuk locked!)
     if avail <= 0:
-        if total > 0:  # ada EDELx tapi terkunci (staked/locked) -> MENUNGGU settlement lepas
-            log(f"[{em}] SKIP: EDELx terkunci {total:.2f} (menunggu settlement)"); return "locked"
+        if (locked_amt + staked_amt) > 0:  # ada EDELx tapi terkunci (staked/locked) -> MENUNGGU settlement lepas
+            log(f"[{em}] SKIP: EDELx terkunci {locked_amt+staked_amt:.2f} (menunggu settlement)"); return "locked"
         log(f"[{em}] SKIP: EDELx=0 (belum deposit)"); return "no_edelx"
     if avail < MIN_EDELX:
         log(f"[{em}] SKIP: EDELx {avail:.4f} < minimum {MIN_EDELX}"); return "below_min"
@@ -422,7 +424,8 @@ def account_history(acct, accts):
         if isinstance(pf, dict):
             e = next((b for b in pf.get("balances", []) if b.get("instrumentId") == "EDELx"), None)
             if e:
-                row["staked"] = units(e.get("staked")); row["available"] = units(e.get("available"))
+                row["staked"] = units(e.get("staked")) + units(e.get("locked"))  # terkunci total (staked+locked)
+                row["available"] = units(e.get("available"))
                 row["total"] = units(e.get("total"))
         st2, lr = api(acct, "GET", "/listing-round")
         rnd = (lr.get("round") if isinstance(lr, dict) else None)
@@ -443,7 +446,7 @@ def show_history(accts, email=None, live=True):
                  "last_window": (a.get("stats") or {}).get("last_window"),
                  "staked": 0, "available": 0, "round": None} for a in ts]
     rows.sort(key=lambda r: r["submitted"], reverse=True)
-    print(f"\n{'EMAIL':<30}{'SUB':>4} {'STAKED':>9}{'AVAIL':>9}  {'FASE':<24}")
+    print(f"\n{'EMAIL':<30}{'SUB':>4} {'LOCKED':>9}{'AVAIL':>9}  {'FASE':<24}")
     print("─" * 82)
     total_sub = 0; ph_count = {}
     for r in rows:

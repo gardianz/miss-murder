@@ -192,7 +192,7 @@ def render(accts, sel=0):
     atab.add_column("PARTY", style=C_DIM, width=11)
     atab.add_column("SES", width=4, justify="center")
     atab.add_column("VF", width=3, justify="center")
-    atab.add_column("EDELx av/stk", justify="right", width=15)
+    atab.add_column("EDELx av/lock", justify="right", width=15)
     atab.add_column("SUB", width=4, justify="right")
     atab.add_column("FASE", width=13)
     for i in range(off, min(off + ROWS, n)):
@@ -201,7 +201,7 @@ def render(accts, sel=0):
         ses = "[green]✓[/]" if LB.session_valid(a) else "[red]✗[/]"
         vf = "[green]✓[/]" if a.get("credVerified") is True else "[yellow]?[/]"
         e = live.get("edelx")
-        edx = f"{e['available']:.1f}/{e['staked']:.1f}" if e else "[grey37]—[/]"
+        edx = f"{e['available']:.1f}/{(e['staked']+e['locked']):.1f}" if e else "[grey37]—[/]"  # avail / (staked+locked terkunci)
         ph = live.get("phase", "idle")
         flabel, fc = PHASE_SHORT.get(ph, ("—", C_DIM))
         sub = (a.get("stats") or {}).get("submitted", 0)
