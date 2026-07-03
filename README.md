@@ -12,7 +12,8 @@ akun disimpan lokal dan dipakai untuk login berulang.
 1. [Konsep singkat](#konsep-singkat)
 2. [Struktur file](#struktur-file)
 3. [Data akun (accounts.json)](#data-akun)
-4. [Cara pakai](#cara-pakai)
+4. [Setup / Instalasi (mesin baru)](#setup--instalasi-mesin-baru)
+5. [Cara pakai](#cara-pakai)
 5. [Alur Listing Calls](#alur-listing-calls)
 6. [Sesi & keandalan](#sesi--keandalan)
 7. [Penanganan kondisi khusus](#penanganan-kondisi-khusus)
@@ -81,6 +82,50 @@ Tiap akun di `accounts.json`:
 - **Party ID** (`hostedPartyId`) = alamat untuk deposit EDELx. Sama dengan yang muncul di halaman
   `/profile` (tombol "Reveal Party ID").
 - `credVerified: true` → aman dipakai / dideposit. `false` → kunci salah (register ulang).
+
+---
+
+## Setup / Instalasi (mesin baru)
+
+Clone repo, install dependency, siapkan data. Path akun **otomatis relatif** ke lokasi script
+(tak lagi hardcode) — jalankan dari folder repo mana pun.
+
+```bash
+# 1. clone (repo privat)
+git clone https://github.com/gardianz/miss-murder.git
+cd miss-murder
+
+# 2. install dependency Python (requests, cryptography, rich, questionary)
+pip3 install -r requirements.txt
+#   Ubuntu baru kena "externally-managed-environment":
+pip3 install --break-system-packages -r requirements.txt
+#   atau pakai venv (disarankan):
+python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+
+# 3. siapkan data akun — accounts.json TIDAK ikut repo (gitignore, berisi private key)
+#    a) SALIN dari mesin lama:  scp user@vps-lama:.../accounts.json .
+#    b) atau register baru:     python3 register_http.py 10
+
+# 4. (opsional) proxy — salin daftar proxy
+cp .proxies.txt.example ~/.proxies.txt   # lalu isi proxy asli, atau jalan tanpa proxy (lihat di bawah)
+
+# 5. jalankan
+python3 edel_cli.py            # menu interaktif + dashboard
+```
+
+**Catatan penting:**
+- `accounts.json`, `~/.proxies.txt`, `party_ids.csv` **tidak ada di repo** (rahasia) — wajib disalin/dibuat manual.
+- Path accounts.json default = folder repo. Override dengan env `EDEL_STATE=/path/ke/accounts.json`.
+- **Tanpa proxy:** set `NO_PROXY=1` (mis. `NO_PROXY=1 python3 listing_bot.py --auto`) atau
+  toggle di menu CLI **🌐 Proxy: ON/OFF**. Ini mengabaikan proxy per-akun & pool → koneksi langsung.
+
+### Daemon (jalan terus di background)
+```bash
+# auto listing tiap window (poll cepat 25s, hard-retry 6x)
+screen -dmS listing bash -c 'HTTP_READ_TO=20 WORKERS=6 AUTO_POLL_FAST=25 HARD_RETRY=6 python3 -u listing_bot.py --auto > auto.log 2>&1'
+screen -r listing     # lihat  (Ctrl-A D keluar)
+screen -S listing -X quit   # stop
+```
 
 ---
 
@@ -238,6 +283,8 @@ server Edel; hanya bisa menunggu retry server. Pantau lewat menu **Pantau Settle
 
 | Masalah | Solusi |
 |---------|--------|
+| `ModuleNotFoundError: No module named 'requests'` | Dependency belum diinstall → `pip3 install -r requirements.txt` (lihat [Setup](#setup--instalasi-mesin-baru)) |
+| `accounts.json` tak terbaca / 0 akun padahal sudah diisi | Dulu path hardcode; sekarang relatif ke script. Pastikan `accounts.json` ada di folder repo, atau set `EDEL_STATE=/path/accounts.json`. Cek: `python3 -c "import listing_bot as LB; print(LB.STATE, len(LB.load_accts()))"` |
 | `rich`/`questionary` not found | `pip install rich questionary` |
 | Register selalu gagal (`startStatus 5xx`) | Server Edel sering down; `run_until_100.sh` retry otomatis |
 | Login 401 "Could not verify login" | `signCount` terlalu rendah (sudah di-handle: pakai unix detik) **atau** kunci privat salah (akun BAD) |

@@ -15,7 +15,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 
 BASE = "https://runway.edel.finance"; ORIGIN = BASE
-STATE = "/home/hermes/garapan/anu-regis/edel-regis/accounts.json"
+BASEDIR = os.path.dirname(os.path.abspath(__file__))  # portabel: relatif ke lokasi script
+STATE = os.environ.get("EDEL_STATE") or os.path.join(BASEDIR, "accounts.json")
 TEMPIK = "https://tempik.weling.web.id/api"
 
 def b64u(b): return base64.urlsafe_b64encode(b).decode().rstrip("=")

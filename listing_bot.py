@@ -18,8 +18,9 @@ from contextlib import contextmanager
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 
-ENGINE = "/home/hermes/garapan/anu-regis/edel-regis/engine"
-STATE  = "/home/hermes/garapan/anu-regis/edel-regis/accounts.json"
+BASEDIR = os.path.dirname(os.path.abspath(__file__))  # portabel: relatif ke lokasi script (bukan hardcode)
+ENGINE = os.path.join(BASEDIR, "engine")
+STATE  = os.environ.get("EDEL_STATE") or os.path.join(BASEDIR, "accounts.json")
 LOCK   = STATE + ".lock"
 BASE   = "https://runway.edel.finance"
 ORIGIN = "https://runway.edel.finance"
