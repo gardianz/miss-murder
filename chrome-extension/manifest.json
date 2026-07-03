@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Edel Session Exporter",
+  "version": "1.0",
+  "description": "Ekspor cookie sesi akun Edel Runway (yang login manual di browser) supaya bisa dipakai bot listing calls.",
+  "permissions": ["cookies"],
+  "host_permissions": ["https://runway.edel.finance/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Edel Export"
+  }
+}

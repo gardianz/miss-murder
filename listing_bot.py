@@ -265,6 +265,8 @@ def do_listing(acct, accts, rankmap, log=print):
     em = acct["email"]
     # 1) sesi/login — kalau akun TAK ADA di server atau kredensial invalid, login gagal -> skip aman
     if not ensure_session(acct, accts):
+        if is_manual(acct):  # akun browser: cookie mati & tak ada key buat relogin
+            log(f"[{em}] SKIP: cookie akun manual kedaluwarsa — ekspor ulang dari Chrome extension"); return "cookie_expired"
         log(f"[{em}] SKIP: login gagal (akun tak terdaftar / server down)"); return "no_session"
     # 2) saldo EDELx
     st, pf = api(acct, "GET", "/portfolio")  # api auto-handle 401/5xx/proxy
@@ -309,8 +311,15 @@ def do_listing(acct, accts, rankmap, log=print):
         return "submitted"
     log(f"[{em}] submit gagal: {st} {_err_code(sub) or ''}"); return "fail"
 
+def is_manual(acct):
+    """Akun login-browser: punya cookie session tapi TAK punya private key (passkey browser
+    tak bisa di-ekspor). Bot pakai cookie sampai mati, TAK bisa auto-relogin."""
+    return not (acct.get("credential") or {}).get("privateKey") and bool((acct.get("session") or {}).get("value"))
+
 def targets(accts, email=None):
-    t = [a for a in accts if a.get("ok") and a.get("credential", {}).get("privateKey")]
+    # akun BOT (punya private key) ATAU akun MANUAL (punya cookie session) sama-sama ikut
+    t = [a for a in accts if a.get("ok") and (
+        (a.get("credential") or {}).get("privateKey") or (a.get("session") or {}).get("value"))]
     if email: t = [a for a in t if a["email"] == email]
     return t
 
@@ -368,7 +377,9 @@ def auto_loop(accts, workers=8, poll_slow=None, poll_fast=None, log=print, stop=
             joined = submitted + c.get("already", 0)
             waiting = locked + c.get("pending", 0)
             if submitted: log(f"[auto] window {(wid or '')[11:16]}: +{submitted} submit (total {AUTO_STATE['total_submitted']})")
-            log(f"[auto] partisipasi window {(wid or '')[11:16]}: ikut={joined} nunggu-settle={waiting} gagal-sisa={fail} belum-deposit={c.get('no_edelx',0)}")
+            ck = c.get("cookie_expired", 0)
+            log(f"[auto] partisipasi window {(wid or '')[11:16]}: ikut={joined} nunggu-settle={waiting} gagal-sisa={fail} belum-deposit={c.get('no_edelx',0)}"
+                + (f" cookie-mati={ck}" if ck else ""))
             # poll CEPAT selama masih ada yang bisa diulang (locked nunggu settle / fail / no_session / pending)
             retry = locked + fail + c.get("no_session", 0) + c.get("pending", 0)
             wait = poll_fast if retry > 0 else poll_slow

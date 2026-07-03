@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { width: 380px; font: 13px/1.4 system-ui, sans-serif; margin: 0; padding: 12px; background:#0d1117; color:#c9d1d9; }
+    h1 { font-size: 14px; margin: 0 0 8px; color:#58a6ff; }
+    button { background:#238636; color:#fff; border:0; padding:8px 12px; border-radius:6px; cursor:pointer; font-weight:600; }
+    button:hover { background:#2ea043; }
+    button.copy { background:#1f6feb; margin-left:6px; }
+    button.copy:hover { background:#388bfd; }
+    #status { margin:8px 0; min-height:16px; color:#8b949e; }
+    #status.ok { color:#3fb950; }
+    #status.err { color:#f85149; }
+    textarea { width:100%; height:200px; box-sizing:border-box; background:#010409; color:#c9d1d9;
+      border:1px solid #30363d; border-radius:6px; padding:8px; font:11px/1.3 ui-monospace, monospace; resize:vertical; }
+    .row { margin-bottom:8px; }
+    .hint { font-size:11px; color:#6e7681; margin-top:8px; }
+  </style>
+</head>
+<body>
+  <h1>Edel Session Exporter</h1>
+  <div class="row">
+    <button id="btn">Ekspor akun aktif</button>
+    <button id="copy" class="copy">Salin JSON</button>
+  </div>
+  <div id="status"></div>
+  <textarea id="out" placeholder="Klik &quot;Ekspor akun aktif&quot; setelah login di runway.edel.finance ..." spellcheck="false"></textarea>
+  <div class="hint">
+    Login akun kamu di <b>runway.edel.finance</b> dulu, lalu klik Ekspor.
+    Salin JSON → jalankan <code>python3 import_session.py</code> di server bot.
+    Cookie mati ~12 jam → ulangi ekspor.
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

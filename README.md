@@ -12,7 +12,8 @@ akun disimpan lokal dan dipakai untuk login berulang.
 1. [Konsep singkat](#konsep-singkat)
 2. [Struktur file](#struktur-file)
 3. [Data akun (accounts.json)](#data-akun)
-4. [Setup / Instalasi (mesin baru)](#setup--instalasi-mesin-baru)
+4. [Import akun login-manual (Chrome extension)](#import-akun-login-manual-browser--chrome-extension)
+5. [Setup / Instalasi (mesin baru)](#setup--instalasi-mesin-baru)
 5. [Cara pakai](#cara-pakai)
 5. [Alur Listing Calls](#alur-listing-calls)
 6. [Sesi & keandalan](#sesi--keandalan)
@@ -47,6 +48,8 @@ akun disimpan lokal dan dipakai untuk login berulang.
 | `run_until_100.sh` | Loop register sampai target akun tercapai (dipakai via `screen`) |
 | `listing_bot.py` | **Inti**: login HTTP, sesi, Listing Calls, paralel, file-lock |
 | `sender_bot.py` | **Bulk sender EDELx** antar akun (rotasi sender, min 100) |
+| `chrome-extension/` | Extension Chrome: ekspor cookie sesi akun login-manual → JSON |
+| `import_session.py` | Import JSON akun manual (dari extension) ke `accounts.json` |
 | `edel_cli.py` | **CLI interaktif + dashboard** gaya Bloomberg |
 | `verify_accounts.py` | Verifikasi semua akun bisa login (tandai `credVerified`) |
 | `accounts.json` | Database akun (credential, party id, sesi) — **file kritis** |
@@ -82,6 +85,30 @@ Tiap akun di `accounts.json`:
 - **Party ID** (`hostedPartyId`) = alamat untuk deposit EDELx. Sama dengan yang muncul di halaman
   `/profile` (tombol "Reveal Party ID").
 - `credVerified: true` → aman dipakai / dideposit. `false` → kunci salah (register ulang).
+
+---
+
+## Import akun login-manual (browser) — Chrome extension
+
+Akun yang kamu daftarkan **manual di browser** (passkey/WebAuthn) **tidak bisa** login otomatis
+lewat bot: private key passkey browser **tak bisa di-ekspor** (desain WebAuthn). Solusi: pakai
+**cookie sesi** akun tersebut.
+
+Folder `chrome-extension/` = extension kecil yang membaca cookie `edel_session` (walau *httpOnly*,
+`chrome.cookies` API bisa) lalu keluarkan JSON akun siap-impor.
+
+**Pakai:**
+1. `chrome://extensions` → aktifkan **Developer mode** → **Load unpacked** → pilih folder `chrome-extension/`.
+2. Login akun kamu di `runway.edel.finance` di tab Chrome.
+3. Klik ikon extension → **Ekspor akun aktif** → **Salin JSON**.
+4. Di server bot: `python3 import_session.py` lalu tempel JSON (Ctrl-D), atau `python3 import_session.py akun.json`.
+
+**Batasan (penting):**
+- Akun manual = `"manual": true`, **tanpa** `credential.privateKey`, hanya `session`.
+- Bot pakai cookie **selama hidup (~12 jam)**. Cookie mati → status `cookie_expired` → **ekspor ulang**
+  dari Chrome (bot **tak bisa** auto-relogin karena tak punya private key).
+- Balance / listing calls tetap jalan normal selama cookie valid.
+- `import_session.py` untuk akun bot yang sudah ada → **hanya** segarkan cookie, private key dijaga.
 
 ---
 
