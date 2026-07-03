@@ -20,6 +20,19 @@ from cryptography.hazmat.primitives import serialization
 
 BASEDIR = os.path.dirname(os.path.abspath(__file__))  # portabel: relatif ke lokasi script (bukan hardcode)
 ENGINE = os.path.join(BASEDIR, "engine")
+
+def _load_dotenv(path):
+    """Muat KEY=VALUE dari file .env ke os.environ (tanpa override env yang sudah di-set). Tanpa dependency."""
+    try:
+        for line in open(path):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line: continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except Exception:
+        pass
+_load_dotenv(os.environ.get("EDEL_ENV") or os.path.join(BASEDIR, ".env"))  # baca .env kalau ada
+
 STATE  = os.environ.get("EDEL_STATE") or os.path.join(BASEDIR, "accounts.json")
 LOCK   = STATE + ".lock"
 BASE   = "https://runway.edel.finance"

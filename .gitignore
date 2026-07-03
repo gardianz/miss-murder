@@ -13,6 +13,10 @@ proxies.txt
 *.lock
 *.tmp
 
+# ═══ secret env (token telegram dll) ═══
+.env
+.env.local
+
 # ═══ log & runtime ═══
 *.log
 register_*.log
