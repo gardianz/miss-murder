@@ -71,7 +71,7 @@ def _proxy_dict(proxy):
 
 # timeout (connect, read): connect pendek supaya proxy mati cepat gagal & dirotasi
 HTTP_TIMEOUT = (float(os.environ.get("HTTP_CONNECT_TO", "4")), float(os.environ.get("HTTP_READ_TO", "11")))
-API_DEADLINE = float(os.environ.get("API_DEADLINE", "28"))  # budget total per request (detik)
+API_DEADLINE = float(os.environ.get("API_DEADLINE", "40"))  # budget total per request (detik) — retry proxy sampai budget habis
 
 def _raw_http(cookie, proxy, method, path, body, timeout=HTTP_TIMEOUT):
     """Satu request mentah. Return (status:int|'ERR', data, set_cookie_obj_or_None)."""
@@ -98,8 +98,11 @@ def api(acct, method, path, body=None, retries=5, auth=True):
     relogin_count = 0
     last = None
     t0 = time.time()
-    for attempt in range(retries):
-        if time.time() - t0 > API_DEADLINE: break  # cap total waktu -> tak nyangkut lama
+    attempt = 0
+    # RETRY sampai budget habis (bukan cap 5x) — proxy mati/5xx dirotasi terus sampai API_DEADLINE.
+    # Sebelumnya retries=5 bikin ERR muncul dalam ~1.5s saat proxy connection-refused.
+    while time.time() - t0 <= API_DEADLINE:
+        attempt += 1
         cookie = (acct.get("session") or {}).get("value") if auth else None
         st, data, _ = _raw_http(cookie, proxy, method, path, body)
         if st == "ERR":
@@ -109,7 +112,7 @@ def api(acct, method, path, body=None, retries=5, auth=True):
             time.sleep(0.3)
             continue
         if st in (401, 403) and auth:
-            if relogin_count < 2:
+            if relogin_count < 3:
                 relogin_count += 1
                 if refresh_session(acct, accts): continue
             last = f"{st} (auth; relogin x{relogin_count})"
@@ -117,7 +120,7 @@ def api(acct, method, path, body=None, retries=5, auth=True):
             continue
         if st >= 500:
             last = f"{st}"
-            time.sleep(min(1.6 ** attempt, 6))  # backoff singkat
+            time.sleep(min(1.6 ** min(attempt, 6), 6))  # backoff singkat
             continue
         return st, data  # 2xx/4xx (selain 401/403) -> hasil final
     return "ERR", last
@@ -205,6 +208,18 @@ def _err_code(data):
     if isinstance(data, dict): return (data.get("error") or {}).get("code")
     return None
 
+def _bump_stats(a, window, stake):
+    """Catat 1 submit sukses ke acct['stats'] (dedup per window)."""
+    s = a.setdefault("stats", {"submitted": 0, "windows": []})
+    wins = s.setdefault("windows", [])
+    if window and window in wins: return  # sudah dihitung window ini
+    if window: wins.append(window)
+    if len(wins) > 200: del wins[:-200]  # cap memori
+    s["submitted"] = s.get("submitted", 0) + 1
+    s["last_submit"] = time.time()
+    s["last_window"] = window
+    s["last_stake"] = stake
+
 def do_listing(acct, accts, rankmap, log=print):
     """Return status: submitted | locked (menunggu settlement) | no_edelx | below_min |
     already (sudah submit window ini) | no_session | freeze | pending | fail."""
@@ -247,7 +262,9 @@ def do_listing(acct, accts, rankmap, log=print):
     picks = [{"listingDecisionId": o["listingDecisionId"], "assetId": pick_asset(o, rankmap)} for o in preview["options"]]
     st, sub = api(acct, "POST", "/listing-round/submit", {"previewId": preview["id"], "picks": picks})
     if st == 200 and isinstance(sub, dict) and sub.get("round", {}).get("status") == "SUBMITTED":
-        log(f"[{em}] ✓ SUBMITTED {len(picks)} picks, stake={units(preview.get('stakeAmount')):.2f} EDELx")
+        stake = units(preview.get("stakeAmount")); wid = preview.get("roundWindowId")
+        update_account(em, lambda a: _bump_stats(a, wid, stake))  # catat statistik (atomik, dedup window)
+        log(f"[{em}] ✓ SUBMITTED {len(picks)} picks, stake={stake:.2f} EDELx (window {(wid or '')[11:16]})")
         return "submitted"
     log(f"[{em}] submit gagal: {st} {_err_code(sub) or ''}"); return "fail"
 
@@ -269,7 +286,7 @@ def _window_info(accts):
 
 # status auto (dibaca UI dashboard)
 AUTO_STATE = {"running": False, "window": None, "server": None, "submitted": 0, "locked": 0,
-              "no_edelx": 0, "already": 0, "next_in": 0, "last": 0}
+              "no_edelx": 0, "already": 0, "fail": 0, "next_in": 0, "last": 0, "total_submitted": 0}
 
 def auto_loop(accts, workers=8, poll_slow=None, poll_fast=None, log=print, stop=None):
     """AUTO: jalan terus, submit listing calls tiap window. Idempotent → akun yang EDELx-nya baru
@@ -293,11 +310,15 @@ def auto_loop(accts, workers=8, poll_slow=None, poll_fast=None, log=print, stop=
             res = run_all(accts, workers=workers, log=log, stop=stop)
             c = {}
             for v in res.values(): c[v] = c.get(v, 0) + 1
-            submitted, locked = c.get("submitted", 0), c.get("locked", 0)
-            AUTO_STATE.update(submitted=submitted, locked=locked,
+            submitted, locked, fail = c.get("submitted", 0), c.get("locked", 0), c.get("fail", 0)
+            AUTO_STATE["total_submitted"] += submitted
+            AUTO_STATE.update(submitted=submitted, locked=locked, fail=fail,
                               no_edelx=c.get("no_edelx", 0), already=c.get("already", 0), last=time.time())
-            if submitted: log(f"[auto] window {(wid or '')[11:16]}: +{submitted} submit")
-            wait = poll_fast if locked > 0 else poll_slow
+            if submitted: log(f"[auto] window {(wid or '')[11:16]}: +{submitted} submit (total {AUTO_STATE['total_submitted']})")
+            # poll CEPAT kalau ada yang perlu diulang: locked (nunggu settlement) / fail (proxy err) / no_session
+            retry = locked + fail + c.get("no_session", 0) + c.get("pending", 0)
+            wait = poll_fast if retry > 0 else poll_slow
+            if fail: log(f"[auto] {fail} akun gagal (proxy/jaringan) → ULANG {wait}s")
             if locked: log(f"[auto] {locked} akun menunggu settlement → cek lagi {wait}s")
         except Exception as e:
             log(f"[auto] err: {str(e)[:90]}"); wait = poll_fast
@@ -341,10 +362,53 @@ def run_all(accts, emails=None, workers=8, log=print, stop=None):
         ex.shutdown(wait=False, cancel_futures=True)
     return results
 
+def account_history(acct, accts):
+    """Statistik submit lokal + saldo live + status round sekarang. Return dict."""
+    s = acct.get("stats") or {}
+    row = {"email": acct["email"], "submitted": s.get("submitted", 0),
+           "last_window": s.get("last_window"), "last_stake": s.get("last_stake"),
+           "staked": 0.0, "available": 0.0, "total": 0.0, "round": None}
+    if session_valid(acct) or ensure_session(acct, accts):
+        st, pf = api(acct, "GET", "/portfolio")
+        if isinstance(pf, dict):
+            e = next((b for b in pf.get("balances", []) if b.get("instrumentId") == "EDELx"), None)
+            if e:
+                row["staked"] = units(e.get("staked")); row["available"] = units(e.get("available"))
+                row["total"] = units(e.get("total"))
+        st2, lr = api(acct, "GET", "/listing-round")
+        rnd = (lr.get("round") if isinstance(lr, dict) else None)
+        row["round"] = rnd.get("status") if rnd else None
+    return row
+
+def show_history(accts, email=None, live=True):
+    """Tabel: berapa listing call berhasil per akun + total keseluruhan. live=cek saldo server."""
+    from concurrent.futures import ThreadPoolExecutor
+    ts = targets(accts, email)
+    if not ts: print("tak ada akun target"); return
+    if live:
+        with ThreadPoolExecutor(max_workers=min(10, len(ts))) as ex:
+            rows = list(ex.map(lambda a: account_history(a, accts), ts))
+    else:
+        rows = [{"email": a["email"], "submitted": (a.get("stats") or {}).get("submitted", 0),
+                 "last_window": (a.get("stats") or {}).get("last_window"),
+                 "staked": 0, "available": 0, "round": None} for a in ts]
+    rows.sort(key=lambda r: r["submitted"], reverse=True)
+    print(f"\n{'EMAIL':<34}{'SUBMIT':>7} {'LAST WINDOW':<18}{'STAKED':>10}{'AVAIL':>10} {'ROUND':<10}")
+    print("─" * 92)
+    total_sub = 0
+    for r in rows:
+        total_sub += r["submitted"]
+        lw = (r.get("last_window") or "-")
+        lw = lw[5:16] if lw and lw != "-" else "-"
+        print(f"{r['email']:<34}{r['submitted']:>7} {lw:<18}{r['staked']:>10.2f}{r['available']:>10.2f} {str(r.get('round') or '-'):<10}")
+    print("─" * 92)
+    n_active = sum(1 for r in rows if r["submitted"] > 0)
+    print(f"TOTAL listing call sukses: {total_sub}  |  akun aktif: {n_active}/{len(rows)}")
+
 def main():
     global _ACCTS
     mode = sys.argv[1] if len(sys.argv) > 1 else "--status"
-    email = sys.argv[2] if len(sys.argv) > 2 else None
+    email = next((a for a in sys.argv[2:] if not a.startswith("-")), None)  # arg non-flag pertama
     accts = load_accts()
     _ACCTS = accts  # api() pakai ini untuk auto re-login + persist cookie baru
     ts = targets(accts, email)
@@ -366,6 +430,10 @@ def main():
             print(f"[{a['email']}] EDELx={bal.get('EDELx')} round={rnd.get('status') if rnd else None}")
         return
 
+    if mode == "--history":
+        show_history(accts, email, live="--fast" not in sys.argv)
+        return
+
     if mode == "--run":
         workers = int(os.environ.get("WORKERS", "8"))
         emails = [email] if email else None
@@ -380,7 +448,7 @@ def main():
         except KeyboardInterrupt: print("\n[auto] berhenti")
         return
 
-    print("mode: --run | --session | --status  [email]")
+    print("mode: --run | --auto | --session | --status | --history  [email]")
 
 if __name__ == "__main__":
     main()

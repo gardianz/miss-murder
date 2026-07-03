@@ -151,16 +151,20 @@ def render(accts, sel=0):
     sesok = sum(1 for a in ts if LB.session_valid(a))
     edelx_tot = sum((FLEET["data"].get(a["email"], {}).get("edelx") or {}).get("total", 0) for a in ts)
     submitted = sum(1 for a in ts if FLEET["data"].get(a["email"], {}).get("round") == "SUBMITTED")
+    calls_tot = sum((a.get("stats") or {}).get("submitted", 0) for a in ts)  # total listing call sukses (kumulatif)
     parts = [
         ("ACCOUNTS ", C_DIM), (f"{n}", C_VAL), ("  VERIFIED ", C_DIM), (f"{verif}", C_OK),
         ("  SESSION OK ", C_DIM), (f"{sesok}", C_OK if sesok else C_WARN),
         ("  EDELx ", C_DIM), (f"{fmt_amt(edelx_tot)}", C_AMBER),
-        ("  SUBMITTED ", C_DIM), (f"{submitted}", C_KEY),
+        ("  ROUND-SUB ", C_DIM), (f"{submitted}", C_KEY),
+        ("  CALLS✓ ", C_DIM), (f"{calls_tot}", C_OK),
     ]
     au = LB.AUTO_STATE
     if au.get("running"):
         parts += [("   🔁 AUTO ", "bold black on green"), (" sub=", C_DIM), (f"{au['submitted']}", C_OK),
+                  (" total=", C_DIM), (f"{au.get('total_submitted',0)}", C_OK),
                   (" locked=", C_DIM), (f"{au['locked']}", C_WARN),
+                  (" fail=", C_DIM), (f"{au.get('fail',0)}", C_WARN),
                   (" next=", C_DIM), (f"{int(au.get('next_in',0))}s", C_KEY)]
     summ = Text.assemble(*parts)
 
@@ -176,6 +180,7 @@ def render(accts, sel=0):
     atab.add_column("SES", width=4, justify="center")
     atab.add_column("VF", width=3, justify="center")
     atab.add_column("EDELx av/stk", justify="right", width=15)
+    atab.add_column("SUB", width=4, justify="right")
     atab.add_column("ROUND", width=10)
     for i in range(off, min(off + ROWS, n)):
         a = ts[i]; em = a["email"]; live = FLEET["data"].get(em, {})
@@ -186,9 +191,11 @@ def render(accts, sel=0):
         edx = f"{e['available']:.1f}/{e['staked']:.1f}" if e else "[grey37]—[/]"
         rnd = live.get("round") or "—"
         rc = C_KEY if rnd == "SUBMITTED" else (C_DIM if rnd in ("—", None) else C_WARN)
+        sub = (a.get("stats") or {}).get("submitted", 0)
+        subc = f"[{C_OK}]{sub}[/]" if sub else "[grey37]0[/]"
         rstyle = "black on orange1" if i == sel else None  # highlight baris terpilih
         mark = "▶" if i == sel else " "
-        atab.add_row(mark, em.split("@")[0][:20], party, ses, vf, edx, f"[{rc}]{rnd}[/]", style=rstyle)
+        atab.add_row(mark, em.split("@")[0][:20], party, ses, vf, edx, subc, f"[{rc}]{rnd}[/]", style=rstyle)
     atab.caption = f"↑/↓ pilih · q keluar    [{sel+1}/{n}]"
 
     # panel bawah: DETAIL + LOG akun terpilih
@@ -407,6 +414,12 @@ def act_send(accts):
     console.print(f"[bold green]selesai: {ok}/{len(res)} transfer sukses[/]")
     questionary.text("enter untuk lanjut").ask()
 
+def act_history(accts):
+    live = questionary.confirm("Cek saldo LIVE dari server? (lambat, tapi akurat)", default=True).ask()
+    console.print("[dim]menghitung riwayat listing call…[/]")
+    LB.show_history(accts, live=bool(live))
+    questionary.text("enter untuk lanjut").ask()
+
 def menu():
     accts = LB.load_accts(); LB._ACCTS = accts
     while True:
@@ -414,7 +427,7 @@ def menu():
             "EDEL DESK TERMINAL — pilih:",
             choices=["📊 Dashboard live", "➕ Register Akun (HTTP)", "▶  Jalankan Listing Calls (sekali)",
                      "🔁 Auto Listing (tiap window)", "💸 Kirim EDELx (bulk)", "🔑 Refresh Sesi",
-                     "📋 Status Fleet", "🏦 Party IDs (deposit)", "⏳ Pantau Settlement", "❌ Keluar"],
+                     "📈 Riwayat Listing Call", "📋 Status Fleet", "🏦 Party IDs (deposit)", "⏳ Pantau Settlement", "❌ Keluar"],
         ).ask()
         if not choice or choice.startswith("❌"): break
         accts = LB.load_accts(); LB._ACCTS = accts  # reload state fresh
@@ -424,6 +437,7 @@ def menu():
         elif choice.startswith("🔁"): act_auto(accts)
         elif choice.startswith("💸"): act_send(accts)
         elif choice.startswith("🔑"): act_sessions(accts)
+        elif choice.startswith("📈"): act_history(accts)
         elif choice.startswith("📋"): act_status(accts)
         elif choice.startswith("🏦"): act_partyids(accts)
         elif choice.startswith("⏳"): act_settle_watch(accts)
