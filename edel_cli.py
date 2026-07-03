@@ -31,6 +31,13 @@ C_HEAD = "bold black on orange1"
 C_KEY = "bright_cyan"; C_OK = "bright_green"; C_WARN = "yellow"; C_BAD = "bright_red"
 C_DIM = "grey62"; C_VAL = "bold white"; C_AMBER = "orange1"
 
+# fase listing call → (label pendek, warna) untuk tabel ACCOUNTS
+PHASE_SHORT = {
+    "idle": ("—", C_DIM), "preparing": ("Preparing", C_AMBER),
+    "allocation_pending": ("Alloc pend", C_AMBER), "submitted": ("Submitted", C_KEY),
+    "demand_pending": ("DI pending", C_WARN), "final": ("DI final", C_OK), "unknown": ("?", C_DIM),
+}
+
 MARKET = {"ts": 0, "listing": None, "demand": []}      # cache market (window + demand index)
 FLEET = {"ts": 0, "data": {}}                            # cache live per-akun {email: {...}}
 LOG = []                                                  # activity log
@@ -151,14 +158,18 @@ def render(accts, sel=0):
     ts = LB.targets(accts)
     n = len(ts); verif = sum(1 for a in ts if a.get("credVerified") is True)
     sesok = sum(1 for a in ts if LB.session_valid(a))
-    edelx_tot = sum((FLEET["data"].get(a["email"], {}).get("edelx") or {}).get("total", 0) for a in ts)
+    def _sum(k): return sum((FLEET["data"].get(a["email"], {}).get("edelx") or {}).get(k, 0) for a in ts)
+    edelx_tot = _sum("total"); avail_tot = _sum("available"); locked_tot = _sum("locked"); staked_tot = _sum("staked")
     submitted = sum(1 for a in ts if FLEET["data"].get(a["email"], {}).get("round") == "SUBMITTED")
     calls_tot = sum((a.get("stats") or {}).get("submitted", 0) for a in ts)  # total listing call sukses (kumulatif)
     parts = [
         ("ACCOUNTS ", C_DIM), (f"{n}", C_VAL), ("  VERIFIED ", C_DIM), (f"{verif}", C_OK),
         ("  SESSION OK ", C_DIM), (f"{sesok}", C_OK if sesok else C_WARN),
         ("  EDELx ", C_DIM), (f"{fmt_amt(edelx_tot)}", C_AMBER),
-        ("  ROUND-SUB ", C_DIM), (f"{submitted}", C_KEY),
+        ("  avail ", C_DIM), (f"{fmt_amt(avail_tot)}", C_OK),
+        ("  locked ", C_DIM), (f"{fmt_amt(locked_tot)}", C_WARN),
+        ("  staked ", C_DIM), (f"{fmt_amt(staked_tot)}", C_KEY),
+        ("  SUB ", C_DIM), (f"{submitted}", C_KEY),
         ("  CALLS✓ ", C_DIM), (f"{calls_tot}", C_OK),
     ]
     au = LB.AUTO_STATE
@@ -183,7 +194,7 @@ def render(accts, sel=0):
     atab.add_column("VF", width=3, justify="center")
     atab.add_column("EDELx av/stk", justify="right", width=15)
     atab.add_column("SUB", width=4, justify="right")
-    atab.add_column("ROUND", width=10)
+    atab.add_column("FASE", width=13)
     for i in range(off, min(off + ROWS, n)):
         a = ts[i]; em = a["email"]; live = FLEET["data"].get(em, {})
         party = (a.get("hostedPartyId", "").split("edel-user-")[-1][:9]) if a.get("hostedPartyId") else "—"
@@ -191,13 +202,13 @@ def render(accts, sel=0):
         vf = "[green]✓[/]" if a.get("credVerified") is True else "[yellow]?[/]"
         e = live.get("edelx")
         edx = f"{e['available']:.1f}/{e['staked']:.1f}" if e else "[grey37]—[/]"
-        rnd = live.get("round") or "—"
-        rc = C_KEY if rnd == "SUBMITTED" else (C_DIM if rnd in ("—", None) else C_WARN)
+        ph = live.get("phase", "idle")
+        flabel, fc = PHASE_SHORT.get(ph, ("—", C_DIM))
         sub = (a.get("stats") or {}).get("submitted", 0)
         subc = f"[{C_OK}]{sub}[/]" if sub else "[grey37]0[/]"
         rstyle = "black on orange1" if i == sel else None  # highlight baris terpilih
         mark = "▶" if i == sel else " "
-        atab.add_row(mark, em.split("@")[0][:20], party, ses, vf, edx, subc, f"[{rc}]{rnd}[/]", style=rstyle)
+        atab.add_row(mark, em.split("@")[0][:20], party, ses, vf, edx, subc, f"[{fc}]{flabel}[/]", style=rstyle)
     atab.caption = f"↑/↓ pilih · q keluar    [{sel+1}/{n}]"
 
     # panel bawah: DETAIL + LOG akun terpilih
