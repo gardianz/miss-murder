@@ -259,6 +259,29 @@ def _bump_stats(a, window, stake):
     s["last_window"] = window
     s["last_stake"] = stake
 
+# Reason aksi dari GET /listing-round -> actions.{prepareRound|startRound, submitPreview}.reason
+# (enum diambil dari frontend). Dipakai untuk klasifikasi kenapa BELUM bisa submit —
+# JANGAN cap 'already' asal ada round tanpa preview (itu bug lama).
+_R_DONE   = {"ROUND_WINDOW_ALREADY_COMPLETED", "SUBMITTED", "SETTLED"}          # beneran sudah ikut window ini
+_R_LOCKED = {"PREVIOUS_ROUND_SETTLEMENT_PENDING", "SETTLEMENT_PENDING", "LOCK_PENDING"}  # nunggu settle round lalu
+_R_FREEZE = {"VAULT_MIGRATION_FREEZE", "VAULT_STAKE_LOCKER_DISABLED"}
+_R_CLOSED = {"SELECTION_CLOSED", "EXPIRED"}                                     # window ini sudah tutup (terlewat)
+# sisanya (SELECTION_NOT_OPEN, ROUND_NOT_LOCKED, NO_ACTIVE_DECISION_*, CREATED, DECISION_PREVIEW_*) -> retry
+
+def _submit_preview(acct, preview, rankmap, log):
+    """Submit picks dari sebuah preview. Return 'submitted' | 'fail'."""
+    em = acct["email"]
+    if not preview or not preview.get("options"):
+        return "fail"
+    picks = [{"listingDecisionId": o["listingDecisionId"], "assetId": pick_asset(o, rankmap)} for o in preview["options"]]
+    st, sub = api(acct, "POST", "/listing-round/submit", {"previewId": preview["id"], "picks": picks})
+    if st == 200 and isinstance(sub, dict) and sub.get("round", {}).get("status") == "SUBMITTED":
+        stake = units(preview.get("stakeAmount")); wid = preview.get("roundWindowId")
+        update_account(em, lambda a: _bump_stats(a, wid, stake))  # catat statistik (atomik, dedup window)
+        log(f"[{em}] ✓ SUBMITTED {len(picks)} picks, stake={stake:.2f} EDELx (window {(wid or '')[11:16]})")
+        return "submitted"
+    log(f"[{em}] submit gagal: {st} {_err_code(sub) or ''}"); return "fail"
+
 def do_listing(acct, accts, rankmap, log=print):
     """Return status: submitted | locked (menunggu settlement) | no_edelx | below_min |
     already (sudah submit window ini) | no_session | freeze | pending | fail."""
@@ -283,33 +306,64 @@ def do_listing(acct, accts, rankmap, log=print):
         log(f"[{em}] SKIP: EDELx=0 (belum deposit)"); return "no_edelx"
     if avail < MIN_EDELX:
         log(f"[{em}] SKIP: EDELx {avail:.4f} < minimum {MIN_EDELX}"); return "below_min"
-    # 3) buka round
-    st, r = api(acct, "POST", "/listing-round", {})
-    if st not in (200, 201) or not isinstance(r, dict):
+    # 3) cek status round — GET dulu (SUMBER KEBENARAN). Server kirim actions.{prepareRound,
+    #    submitPreview} berisi enabled+reason. Jangan POST buta lalu cap 'already' (bug lama:
+    #    round FAILED / belum-buka / nunggu-settle semua salah dicap sudah-submit).
+    st, lr = api(acct, "GET", "/listing-round")
+    if not isinstance(lr, dict):
+        log(f"[{em}] SKIP: listing-round tak terbaca ({st})"); return "fail"
+    acts = lr.get("actions") or {}
+    prep = acts.get("prepareRound") or acts.get("startRound") or {}
+    subp = acts.get("submitPreview") or {}
+    preview = lr.get("preview")
+    reason = prep.get("reason") or subp.get("reason")
+
+    # (a) preview sudah siap & server izinkan submit -> submit langsung
+    if preview and subp.get("enabled", True):
+        r = _submit_preview(acct, preview, rankmap, log)
+        if r == "submitted": return r
+        # submit gagal (preview basi?) -> lanjut coba prepare ulang di bawah
+
+    # (b) server izinkan buka round -> POST prepare, ambil preview, submit
+    if prep.get("enabled"):
+        st, r = api(acct, "POST", "/listing-round", {})
+        if st in (200, 201) and isinstance(r, dict):
+            pv = r.get("preview")
+            if not pv:  # kadang preview baru muncul di GET setelah prepare
+                st2, lr2 = api(acct, "GET", "/listing-round")
+                pv = lr2.get("preview") if isinstance(lr2, dict) else None
+            if pv:
+                return _submit_preview(acct, pv, rankmap, log)
+            log(f"[{em}] prepared tapi preview kosong -> retry"); return "pending"
         code = _err_code(r)
         if code in ("stake_lock_failed", "listing_stake_holdings_not_found"):
-            log(f"[{em}] SKIP: EDELx tak cukup untuk buka round ({code})"); return "no_edelx"
-        elif code in ("daily_round_limit", "listing_round_limit"):
+            log(f"[{em}] SKIP: EDELx tak cukup buka round ({code})"); return "no_edelx"
+        if code in ("daily_round_limit", "listing_round_limit"):
             log(f"[{em}] SKIP: sudah kena batas window ({code})"); return "already"
-        elif code in ("round_selection_not_open", "listing_decision_cycle_exhausted"):
-            log(f"[{em}] SKIP: window belum buka ({code})"); return "pending"
-        elif code in ("vault_stake_locker_disabled", "vault_migration_freeze"):
-            log(f"[{em}] SKIP: listing calls sedang freeze ({code})"); return "freeze"
-        elif code == "previous_round_settlement_pending":
-            log(f"[{em}] SKIP: settlement round sebelumnya belum selesai"); return "locked"
+        if code in ("round_selection_not_open", "listing_decision_cycle_exhausted", "round_selection_closed"):
+            log(f"[{em}] SKIP: window belum buka/ tutup ({code}) -> retry"); return "pending"
+        if code in ("vault_stake_locker_disabled", "vault_migration_freeze"):
+            log(f"[{em}] SKIP: listing calls freeze ({code})"); return "freeze"
+        if code == "previous_round_settlement_pending":
+            log(f"[{em}] SKIP: settlement round lalu belum selesai"); return "locked"
         log(f"[{em}] buka round gagal: {st} {code or ''}"); return "fail"
-    preview = r.get("preview")
-    if not preview:
-        log(f"[{em}] SKIP: sudah submit window ini"); return "already"
-    # 4) pilih (demand index) + submit
-    picks = [{"listingDecisionId": o["listingDecisionId"], "assetId": pick_asset(o, rankmap)} for o in preview["options"]]
-    st, sub = api(acct, "POST", "/listing-round/submit", {"previewId": preview["id"], "picks": picks})
-    if st == 200 and isinstance(sub, dict) and sub.get("round", {}).get("status") == "SUBMITTED":
-        stake = units(preview.get("stakeAmount")); wid = preview.get("roundWindowId")
-        update_account(em, lambda a: _bump_stats(a, wid, stake))  # catat statistik (atomik, dedup window)
-        log(f"[{em}] ✓ SUBMITTED {len(picks)} picks, stake={stake:.2f} EDELx (window {(wid or '')[11:16]})")
-        return "submitted"
-    log(f"[{em}] submit gagal: {st} {_err_code(sub) or ''}"); return "fail"
+
+    # (c) belum bisa submit sekarang -> klasifikasi
+    # SINYAL PASTI sudah-submit: round.decisions sudah punya pickedAssetId (bukan sekadar 'no preview').
+    rnd = lr.get("round") or {}
+    decs = rnd.get("decisions") or []
+    if decs and all(d.get("pickedAssetId") for d in decs):
+        log(f"[{em}] SKIP: sudah submit window ini (status {rnd.get('status')})"); return "already"
+    if reason in _R_DONE:
+        log(f"[{em}] SKIP: sudah ikut window ini ({reason})"); return "already"
+    if reason in _R_FREEZE:
+        log(f"[{em}] SKIP: listing calls freeze ({reason})"); return "freeze"
+    if reason in _R_LOCKED:
+        log(f"[{em}] SKIP: nunggu settlement round lalu ({reason})"); return "locked"
+    if reason in _R_CLOSED:
+        log(f"[{em}] SKIP: window ini sudah tutup ({reason}) -> tunggu window berikut"); return "pending"
+    # SELECTION_NOT_OPEN / ROUND_NOT_LOCKED / preview belum siap / dll -> COBA LAGI (bukan skip permanen)
+    log(f"[{em}] belum bisa submit ({reason or 'no-preview'}) -> retry"); return "pending"
 
 def is_manual(acct):
     """Akun login-browser: punya cookie session tapi TAK punya private key (passkey browser
