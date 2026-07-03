@@ -436,16 +436,27 @@ def act_history(accts):
     LB.show_history(accts, live=bool(live))
     questionary.text("enter untuk lanjut").ask()
 
+def set_proxy_mode(off):
+    """Set mode proxy runtime (berlaku ke listing/login/register/transfer)."""
+    LB.NO_PROXY = off
+    RH.NO_PROXY = off
+
 def menu():
     accts = LB.load_accts(); LB._ACCTS = accts
     while True:
+        pxlabel = "🌐 Proxy: OFF (koneksi langsung)" if LB.NO_PROXY else "🌐 Proxy: ON (pakai proxy akun)"
         choice = questionary.select(
             "EDEL DESK TERMINAL — pilih:",
             choices=["📊 Dashboard live", "➕ Register Akun (HTTP)", "▶  Jalankan Listing Calls (sekali)",
                      "🔁 Auto Listing (tiap window)", "💸 Kirim EDELx (bulk)", "🔑 Refresh Sesi",
-                     "📈 Riwayat Listing Call", "📋 Status Fleet", "🏦 Party IDs (deposit)", "⏳ Pantau Settlement", "❌ Keluar"],
+                     "📈 Riwayat Listing Call", "📋 Status Fleet", "🏦 Party IDs (deposit)", "⏳ Pantau Settlement",
+                     pxlabel, "❌ Keluar"],
         ).ask()
         if not choice or choice.startswith("❌"): break
+        if choice.startswith("🌐"):
+            set_proxy_mode(not LB.NO_PROXY)
+            console.print(f"[orange1]Proxy sekarang: {'OFF (langsung)' if LB.NO_PROXY else 'ON (proxy akun)'}[/]")
+            continue
         accts = LB.load_accts(); LB._ACCTS = accts  # reload state fresh
         if choice.startswith("📊"): dashboard(accts)
         elif choice.startswith("➕"): act_register(accts)
