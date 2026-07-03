@@ -234,10 +234,10 @@ def phase_from(lr, edelx):
     status = rnd.get("status")
     lock = rnd.get("stakeLockStatus")
     if status == "SUBMITTED":
-        if staked <= 0:               # stake+locked sudah lepas → settlement selesai
-            return "final"
-        if lock and lock != "locked":  # submit tapi belum ter-lock penuh
+        if lock and lock != "locked":  # lock_pending: submit ok tapi stake belum ter-lock (async)
             return "allocation_pending"
+        if staked <= 0:               # sudah pernah locked lalu lepas → settlement selesai
+            return "final"
         if _iso_lt(snow, closes):      # masih dalam window pemilihan
             return "submitted"
         return "demand_pending"        # window tutup, nunggu demand index/settlement
