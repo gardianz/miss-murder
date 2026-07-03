@@ -66,7 +66,10 @@ PROXIES = [l for l in load_proxies() if l and not l.startswith("#")]
 
 _ACCTS = None  # di-set di main(), dipakai api() untuk auto re-login
 
+NO_PROXY = os.environ.get("NO_PROXY", "").lower() in ("1", "true", "yes", "on")  # paksa tanpa proxy
+
 def _proxy_dict(proxy):
+    if NO_PROXY: return None  # abaikan proxy akun/pool -> koneksi langsung
     return {"http": proxy, "https": proxy} if proxy else None
 
 # timeout (connect, read): connect pendek supaya proxy mati cepat gagal & dirotasi
@@ -138,7 +141,7 @@ def refresh_session(acct, accts, tries=6):
     cred = acct.get("credential") or {}
     if not cred.get("privateKey"): return False
     email = acct["email"]; proxy = acct.get("proxy")
-    proxies = {"http": proxy, "https": proxy} if proxy else None
+    proxies = None if NO_PROXY else ({"http": proxy, "https": proxy} if proxy else None)
     s = requests.Session()
     s.headers.update({"Accept": "application/json", "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0", "Origin": ORIGIN, "Referer": ORIGIN + "/login"})

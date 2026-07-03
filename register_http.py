@@ -83,8 +83,10 @@ def tempik_inbox(local):
             json={"localPart": local}, timeout=15)
     except Exception: pass
 
+NO_PROXY = os.environ.get("NO_PROXY", "").lower() in ("1", "true", "yes", "on")
+
 def register_one(email, display, proxy, tries=6):
-    proxies = {"http": proxy, "https": proxy} if proxy else None
+    proxies = None if NO_PROXY else ({"http": proxy, "https": proxy} if proxy else None)
     s = requests.Session()
     s.headers.update({"Accept": "application/json", "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0", "Origin": ORIGIN, "Referer": ORIGIN + "/register"})
