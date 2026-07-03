@@ -89,7 +89,8 @@ def refresh_fleet(accts, workers=10, only_session=True):
     if only_session:
         ts = [a for a in ts if LB.session_valid(a)]
     def one(a):
-        d = {"edelx": None, "round": None}
+        d = {"edelx": None, "round": None, "phase": "idle"}
+        b = None
         st, pf = LB.api(a, "GET", "/portfolio")
         if isinstance(pf, dict):
             b = next((x for x in pf.get("balances", []) if x["instrumentId"] == "EDELx"), None)
@@ -97,6 +98,7 @@ def refresh_fleet(accts, workers=10, only_session=True):
         st, lr = LB.api(a, "GET", "/listing-round")
         if isinstance(lr, dict):
             rnd = lr.get("round"); d["round"] = rnd.get("status") if rnd else "—"
+            d["phase"] = LB.phase_from(lr, b)
         return a["email"], d
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for fut in as_completed([ex.submit(one, a) for a in ts]):
@@ -210,6 +212,9 @@ def render(accts, sel=0):
         d.add_row("EDELx avail", f"[orange1]{e.get('available',0):.2f}[/]", "staked", f"{e.get('staked',0):.2f}")
         d.add_row("locked", f"{e.get('locked',0):.2f}", "total", f"{e.get('total',0):.2f}")
         d.add_row("Round", str(live.get("round") or "—"), "Sesi", exp_txt)
+        fase = LB.PHASE_LABEL.get(live.get("phase", "idle"), "?")
+        sub_sel = (a.get("stats") or {}).get("submitted", 0)
+        d.add_row("Fase", f"[orange1]{fase}[/]", "Calls✓", str(sub_sel))
         pid = a.get("hostedPartyId", "—")
         d.add_row("Party ID", f"[grey62]{pid}[/]", "", "")
         logtxt = Text("\n".join(LOG[-5:]) if LOG else "(idle)", style=C_DIM)  # aktivitas terkini (global)

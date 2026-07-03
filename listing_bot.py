@@ -208,6 +208,41 @@ def _err_code(data):
     if isinstance(data, dict): return (data.get("error") or {}).get("code")
     return None
 
+def _iso_lt(a, b):
+    """a < b untuk timestamp ISO (string compare aman krn ISO Z sama format)."""
+    return bool(a) and bool(b) and a < b
+
+# fase listing call gaya web (diturunkan dari status+timing+posisi; server tak kirim string ini)
+PHASE_LABEL = {
+    "idle": "Menunggu window", "preparing": "Preparing listing calls",
+    "allocation_pending": "Allocation pending", "submitted": "Selection submitted",
+    "demand_pending": "Demand index pending", "final": "Demand index final", "unknown": "?",
+}
+
+def phase_from(lr, edelx):
+    """Turunkan fase dari /listing-round (lr) + balance EDELx (dict units). Return code (lihat PHASE_LABEL)."""
+    if not isinstance(lr, dict): return "unknown"
+    rnd = lr.get("round") or {}
+    prev = lr.get("preview")
+    snow = lr.get("serverTime")
+    closes = (rnd.get("timing") or (lr.get("currentWindow", {}) or {}).get("timing") or {}).get("selectionClosesAt")
+    staked = units(edelx.get("staked")) if edelx else 0
+    status = rnd.get("status")
+    lock = rnd.get("stakeLockStatus")
+    if status == "SUBMITTED":
+        if staked <= 0:               # stake sudah lepas → settlement selesai
+            return "final"
+        if lock and lock != "locked":  # submit tapi belum ter-lock penuh
+            return "allocation_pending"
+        if _iso_lt(snow, closes):      # masih dalam window pemilihan
+            return "submitted"
+        return "demand_pending"        # window tutup, nunggu demand index/settlement
+    if prev:                           # ada preview, belum submit
+        return "preparing"
+    if staked > 0:                     # ke-lock tapi tak ada round aktif (edge)
+        return "demand_pending"
+    return "idle"
+
 def _bump_stats(a, window, stake):
     """Catat 1 submit sukses ke acct['stats'] (dedup per window)."""
     s = a.setdefault("stats", {"submitted": 0, "windows": []})
@@ -367,9 +402,10 @@ def account_history(acct, accts):
     s = acct.get("stats") or {}
     row = {"email": acct["email"], "submitted": s.get("submitted", 0),
            "last_window": s.get("last_window"), "last_stake": s.get("last_stake"),
-           "staked": 0.0, "available": 0.0, "total": 0.0, "round": None}
+           "staked": 0.0, "available": 0.0, "total": 0.0, "round": None, "phase": "idle"}
     if session_valid(acct) or ensure_session(acct, accts):
         st, pf = api(acct, "GET", "/portfolio")
+        e = None
         if isinstance(pf, dict):
             e = next((b for b in pf.get("balances", []) if b.get("instrumentId") == "EDELx"), None)
             if e:
@@ -378,6 +414,7 @@ def account_history(acct, accts):
         st2, lr = api(acct, "GET", "/listing-round")
         rnd = (lr.get("round") if isinstance(lr, dict) else None)
         row["round"] = rnd.get("status") if rnd else None
+        row["phase"] = phase_from(lr, e)
     return row
 
 def show_history(accts, email=None, live=True):
@@ -393,17 +430,19 @@ def show_history(accts, email=None, live=True):
                  "last_window": (a.get("stats") or {}).get("last_window"),
                  "staked": 0, "available": 0, "round": None} for a in ts]
     rows.sort(key=lambda r: r["submitted"], reverse=True)
-    print(f"\n{'EMAIL':<34}{'SUBMIT':>7} {'LAST WINDOW':<18}{'STAKED':>10}{'AVAIL':>10} {'ROUND':<10}")
-    print("─" * 92)
-    total_sub = 0
+    print(f"\n{'EMAIL':<30}{'SUB':>4} {'STAKED':>9}{'AVAIL':>9}  {'FASE':<24}")
+    print("─" * 82)
+    total_sub = 0; ph_count = {}
     for r in rows:
         total_sub += r["submitted"]
-        lw = (r.get("last_window") or "-")
-        lw = lw[5:16] if lw and lw != "-" else "-"
-        print(f"{r['email']:<34}{r['submitted']:>7} {lw:<18}{r['staked']:>10.2f}{r['available']:>10.2f} {str(r.get('round') or '-'):<10}")
-    print("─" * 92)
+        fase = PHASE_LABEL.get(r.get("phase", "idle"), "?")
+        ph_count[fase] = ph_count.get(fase, 0) + 1
+        print(f"{r['email']:<30}{r['submitted']:>4} {r['staked']:>9.2f}{r['available']:>9.2f}  {fase:<24}")
+    print("─" * 82)
     n_active = sum(1 for r in rows if r["submitted"] > 0)
     print(f"TOTAL listing call sukses: {total_sub}  |  akun aktif: {n_active}/{len(rows)}")
+    if live:
+        print("FASE:", " | ".join(f"{k}={v}" for k, v in sorted(ph_count.items(), key=lambda x: -x[1])))
 
 def main():
     global _ACCTS
