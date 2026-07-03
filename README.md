@@ -148,11 +148,23 @@ python3 edel_cli.py            # menu interaktif + dashboard
 
 ### Daemon (jalan terus di background)
 ```bash
-# auto listing tiap window (poll cepat 25s, hard-retry 6x)
-screen -dmS listing bash -c 'HTTP_READ_TO=20 WORKERS=6 AUTO_POLL_FAST=25 HARD_RETRY=6 python3 -u listing_bot.py --auto > auto.log 2>&1'
+# auto listing tiap window (POST prepare edel LAMBAT ~50s -> HTTP_READ_TO tinggi biar tak retry-ganda)
+screen -dmS listing bash -c 'HTTP_READ_TO=75 API_DEADLINE=120 WORKERS=6 AUTO_POLL_FAST=25 HARD_RETRY=6 python3 -u listing_bot.py --auto > auto.log 2>&1'
 screen -r listing     # lihat  (Ctrl-A D keluar)
 screen -S listing -X quit   # stop
 ```
+> `WORKERS` kecil (4–6) menekan FAILED (`VAULT_V6_PQS_REQUEST_FAILED`, timeout stake-lock server saat banyak akun barengan). Bukan bug bot; server Edel kewalahan.
+
+### Alert Telegram (opsional)
+Set 2 env → bot kirim notif tiap akun sukses submit + ringkasan per window:
+```bash
+export TELEGRAM_BOT_TOKEN="123456:ABC..."   # dari @BotFather
+export TELEGRAM_CHAT_ID="123456789"          # chat id kamu (dari @userinfobot) / grup
+# opsi: TG_PER_SUBMIT=0 -> HANYA ringkasan window (hemat, hindari 100+ pesan/window)
+```
+- Tanpa 2 env itu → fitur mati (no-op, tak error).
+- Alert per-submit dedup per (akun,window): 1 pesan per akun per window, termasuk submit yang tembus server walau client timeout.
+- **Awas spam:** 100+ akun = 100+ pesan/window (limit Telegram ~20/mnt/chat → sebagian kena 429). Untuk fleet besar pakai `TG_PER_SUBMIT=0`.
 
 ---
 

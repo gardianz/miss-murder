@@ -52,14 +52,14 @@ def update_account(email, patch):
     """Read-modify-write 1 akun secara ATOMIK (aman untuk paralel). patch(acct_dict) di-mutate in place."""
     with _flock():
         accts = json.load(open(STATE))
-        hit = None
+        result = None
         for a in accts:
             if a["email"] == email:
-                patch(a); hit = a; break
+                result = patch(a); break  # teruskan return patch (mis. _bump_stats -> True kalau baru)
         tmp = STATE + ".tmp"
         json.dump(accts, open(tmp, "w"), indent=2)
         os.replace(tmp, STATE)
-        return hit
+        return result
 def load_proxies():
     fp = os.path.expanduser("~/.proxies.txt")
     return [l.strip() for l in open(fp)] if os.path.exists(fp) else []
@@ -76,6 +76,31 @@ def _proxy_dict(proxy):
 # timeout (connect, read): connect pendek supaya proxy mati cepat gagal & dirotasi
 HTTP_TIMEOUT = (float(os.environ.get("HTTP_CONNECT_TO", "4")), float(os.environ.get("HTTP_READ_TO", "11")))
 API_DEADLINE = float(os.environ.get("API_DEADLINE", "40"))  # budget total per request (detik) — retry proxy sampai budget habis
+
+# ── Telegram alert (opsional) — aktif kalau TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID di-set ──
+import threading
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TG_PER_SUBMIT = os.environ.get("TG_PER_SUBMIT", "1").lower() in ("1", "true", "yes", "on")  # 0 = ringkasan window saja
+
+def _tg_send(text):
+    """Kirim pesan Telegram best-effort, NON-BLOCKING (thread). No-op kalau token/chat kosong."""
+    if not (TG_TOKEN and TG_CHAT): return
+    def _do():
+        try:
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML",
+                                "disable_web_page_preview": True},
+                          proxies=None, timeout=8)
+        except Exception:
+            pass
+    threading.Thread(target=_do, daemon=True).start()
+
+def _notify_submit(em, npicks, stake, wid):
+    """Alert per akun sukses submit (kalau TG_PER_SUBMIT). Awas: 100+ akun = banyak pesan;
+    set TG_PER_SUBMIT=0 untuk ringkasan window saja."""
+    if not TG_PER_SUBMIT: return
+    _tg_send(f"✅ <b>Submit</b> <code>{em}</code>\n{npicks} picks · stake {stake:.2f} EDELx · window {(wid or '')[11:16]}")
 
 def _raw_http(cookie, proxy, method, path, body, timeout=HTTP_TIMEOUT):
     """Satu request mentah. Return (status:int|'ERR', data, set_cookie_obj_or_None)."""
@@ -248,16 +273,17 @@ def phase_from(lr, edelx):
     return "idle"
 
 def _bump_stats(a, window, stake):
-    """Catat 1 submit sukses ke acct['stats'] (dedup per window)."""
+    """Catat 1 submit sukses ke acct['stats'] (dedup per window). Return True kalau BARU dihitung."""
     s = a.setdefault("stats", {"submitted": 0, "windows": []})
     wins = s.setdefault("windows", [])
-    if window and window in wins: return  # sudah dihitung window ini
+    if window and window in wins: return False  # sudah dihitung window ini
     if window: wins.append(window)
     if len(wins) > 200: del wins[:-200]  # cap memori
     s["submitted"] = s.get("submitted", 0) + 1
     s["last_submit"] = time.time()
     s["last_window"] = window
     s["last_stake"] = stake
+    return True
 
 # Reason aksi dari GET /listing-round -> actions.{prepareRound|startRound, submitPreview}.reason
 # (enum diambil dari frontend). Dipakai untuk klasifikasi kenapa BELUM bisa submit —
@@ -274,11 +300,24 @@ def _submit_preview(acct, preview, rankmap, log):
     if not preview or not preview.get("options"):
         return "fail"
     picks = [{"listingDecisionId": o["listingDecisionId"], "assetId": pick_asset(o, rankmap)} for o in preview["options"]]
+    stake = units(preview.get("stakeAmount")); wid = preview.get("roundWindowId")
     st, sub = api(acct, "POST", "/listing-round/submit", {"previewId": preview["id"], "picks": picks})
-    if st == 200 and isinstance(sub, dict) and sub.get("round", {}).get("status") == "SUBMITTED":
-        stake = units(preview.get("stakeAmount")); wid = preview.get("roundWindowId")
-        update_account(em, lambda a: _bump_stats(a, wid, stake))  # catat statistik (atomik, dedup window)
+    ok = st == 200 and isinstance(sub, dict) and sub.get("round", {}).get("status") == "SUBMITTED"
+    if not ok:
+        # submit POST bisa TEMBUS server walau client timeout/ERR (POST edel lambat) -> verifikasi via GET
+        # supaya statistik TIDAK undercount. Kalau round sudah punya picks & bukan FAILED = beneran tersubmit.
+        st2, lr2 = api(acct, "GET", "/listing-round")
+        rnd2 = (lr2.get("round") or {}) if isinstance(lr2, dict) else {}
+        decs = rnd2.get("decisions") or []
+        if rnd2.get("status") != "FAILED" and decs and all(d.get("pickedAssetId") for d in decs):
+            ok = True
+            wid = rnd2.get("roundWindowId") or wid
+            stake = units(rnd2.get("stakeAmount")) or stake
+            log(f"[{em}] submit ERR di client tapi TEMBUS server (verified via GET)")
+    if ok:
+        newwin = update_account(em, lambda a: _bump_stats(a, wid, stake))  # atomik, dedup window; return True kalau baru
         log(f"[{em}] ✓ SUBMITTED {len(picks)} picks, stake={stake:.2f} EDELx (window {(wid or '')[11:16]})")
+        if newwin: _notify_submit(em, len(picks), stake, wid)  # alert Telegram (sekali per window, anti-spam)
         return "submitted"
     log(f"[{em}] submit gagal: {st} {_err_code(sub) or ''}"); return "fail"
 
@@ -355,6 +394,11 @@ def do_listing(acct, accts, rankmap, log=print):
     if rnd.get("status") == "FAILED":  # picks tersubmit tapi stake-lock GAGAL di server; stake dikembalikan.
         log(f"[{em}] round FAILED di server (stake dikembalikan) — server tolak submit ulang, ikut window berikut"); return "failed_round"
     if decs and all(d.get("pickedAssetId") for d in decs):
+        # safety-net undercount: submit yang TEMBUS server tapi tak sempat ke-catat (client timeout) —
+        # catat di sini juga (dedup per-window bikin aman, tak double-count). Alert kalau window ini baru.
+        wid2 = rnd.get("roundWindowId"); stk2 = units(rnd.get("stakeAmount"))
+        newwin = update_account(em, lambda a: _bump_stats(a, wid2, stk2))
+        if newwin: _notify_submit(em, len(decs), stk2, wid2)
         log(f"[{em}] SKIP: sudah submit window ini (status {rnd.get('status')})"); return "already"
     if reason in _R_DONE:
         log(f"[{em}] SKIP: sudah ikut window ini ({reason})"); return "already"
@@ -437,6 +481,11 @@ def auto_loop(accts, workers=8, poll_slow=None, poll_fast=None, log=print, stop=
             log(f"[auto] partisipasi window {(wid or '')[11:16]}: ikut={joined} nunggu-settle={waiting} gagal-sisa={fail} belum-deposit={c.get('no_edelx',0)}"
                 + (f" round-gagal-server={fr}" if fr else "") + (f" cookie-mati={ck}" if ck else ""))
             if fr: log(f"[auto] {fr} akun round FAILED di server (stake balik, tak bisa submit ulang window ini) → ikut window berikut")
+            # ringkasan Telegram per siklus yang ada aktivitas (submit / gagal-server) — anti-spam saat idle
+            if TG_TOKEN and (submitted or fr):
+                _tg_send(f"📊 <b>Window {(wid or '')[11:16]}</b>\n"
+                         f"✅ submit: {submitted} (sesi {AUTO_STATE['total_submitted']})\n"
+                         f"⏳ nunggu-settle: {waiting} · ❌ gagal-server: {fr} · gagal-net: {fail}")
             # poll CEPAT selama masih ada yang bisa diulang (locked nunggu settle / fail / no_session / pending / round-gagal)
             retry = locked + fail + c.get("no_session", 0) + c.get("pending", 0) + fr
             wait = poll_fast if retry > 0 else poll_slow
