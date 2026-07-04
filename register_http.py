@@ -4,8 +4,9 @@ Register akun FULL HTTP (tanpa browser) — bikin WebAuthn attestation 'none' + 
 Server Edel: pubKeyCredParams termasuk alg -8 (Ed25519), attestation 'none' → bisa dibuat manual.
 
 usage:
-  python3 register_http.py [N]        # register N akun (default 1)
-  python3 register_http.py --selftest # validasi builder CBOR vs data tertangkap
+  python3 register_http.py [N]         # register N akun (default 1)
+  python3 register_http.py --until M   # loop register sampai TOTAL akun >= M
+  python3 register_http.py --selftest  # validasi builder CBOR vs data tertangkap
 """
 import os, sys, json, time, uuid, hashlib, base64, secrets, random, fcntl
 from contextlib import contextmanager
@@ -179,10 +180,45 @@ def register_batch(n, workers=4, log=print):
     log(f"[done] {ok}/{n} akun terdaftar (HTTP)")
     return ok
 
+def _count_accts():
+    with _flock():
+        return len(json.load(open(STATE))) if os.path.exists(STATE) else 0
+
+def register_until(target, workers=4, chunk=None, log=print, stop=None):
+    """Loop register sampai TOTAL akun di accounts.json >= target. Tahan-banting: batch gagal
+    di-retry (backoff), hitung ulang dari file (aman paralel/rugi). Return jumlah akun BARU.
+    stop: threading.Event opsional untuk berhenti dini."""
+    start = _count_accts()
+    if start >= target:
+        log(f"[skip] sudah {start} akun (>= target {target})"); return 0
+    made = 0; streak = 0
+    while True:
+        if stop is not None and stop.is_set():
+            log(f"[stop] dihentikan — total {_count_accts()}, +{made} baru"); break
+        cur = _count_accts()
+        if cur >= target:
+            log(f"[done] target {target} tercapai — total {cur} (+{made} baru)"); break
+        need = target - cur
+        batch = min(need, chunk) if chunk else need
+        log(f"[loop] total {cur}/{target} — register {batch}…")
+        ok = register_batch(batch, workers=workers, log=log)
+        made += ok
+        if ok == 0:
+            streak += 1
+            wait = min(15 * streak, 120)
+            log(f"[warn] batch 0 sukses (streak {streak}) — backoff {wait}s"); time.sleep(wait)
+        else:
+            streak = 0
+    return made
+
 def main():
     if "--selftest" in sys.argv: selftest(); return
-    n = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 1
     workers = int(os.environ.get("REG_WORKERS", "4"))
+    if "--until" in sys.argv:
+        i = sys.argv.index("--until")
+        target = int(sys.argv[i + 1]) if i + 1 < len(sys.argv) and sys.argv[i + 1].isdigit() else 0
+        register_until(target, workers=workers); return
+    n = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 1
     register_batch(n, workers=workers)
 
 if __name__ == "__main__":

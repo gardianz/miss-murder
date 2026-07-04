@@ -465,7 +465,8 @@ def auto_loop(accts, workers=8, poll_slow=None, poll_fast=None, log=print, stop=
     while not (stop and stop.is_set()):
         wait = poll_slow
         try:
-            accts = load_accts(); _ACCTS = accts
+            accts[:] = load_accts(); _ACCTS = accts  # REPLACE isi list in-place (bukan rebind) →
+            # dashboard yang pegang objek `accts` yang SAMA ikut lihat cookie fresh hasil refresh_session
             wid, closes, snow = _window_info(accts)
             AUTO_STATE["window"], AUTO_STATE["server"] = wid, snow
             if wid and wid != last_win:

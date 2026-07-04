@@ -316,11 +316,26 @@ def act_run(accts):
     questionary.text("enter untuk lanjut").ask()
 
 def act_register(accts):
-    n = int(questionary.text("Jumlah akun baru (full HTTP, tanpa browser):", default="5").ask() or "5")
+    cur = len(LB.load_accts())
+    mode = questionary.select(
+        f"Register akun (sekarang {cur} akun):",
+        choices=["Tambah N akun (sekali)", "Loop sampai TOTAL target", "Batal"]).ask()
+    if not mode or mode == "Batal": return
     workers = int(questionary.text("paralel workers:", default="4").ask() or "4")
-    console.print(f"[orange1]register {n} akun via HTTP…[/]")
-    ok = RH.register_batch(n, workers=workers, log=lambda m: (logline(m), console.print(m)))
-    console.print(f"[bold green]selesai: {ok}/{n} akun terdaftar[/]")
+    if mode.startswith("Loop"):
+        target = int(questionary.text("TOTAL akun target (loop terus sampai tercapai):",
+                                      default=str(cur + 50)).ask() or str(cur))
+        console.print(f"[orange1]loop register sampai total {target} akun (Ctrl-C untuk stop)…[/]")
+        try:
+            made = RH.register_until(target, workers=workers, log=lambda m: (logline(m), console.print(m)))
+            console.print(f"[bold green]selesai: +{made} akun baru (total {len(LB.load_accts())})[/]")
+        except KeyboardInterrupt:
+            console.print(f"[yellow]dihentikan (total {len(LB.load_accts())} akun)[/]")
+    else:
+        n = int(questionary.text("Jumlah akun baru:", default="5").ask() or "5")
+        console.print(f"[orange1]register {n} akun via HTTP…[/]")
+        ok = RH.register_batch(n, workers=workers, log=lambda m: (logline(m), console.print(m)))
+        console.print(f"[bold green]selesai: {ok}/{n} akun terdaftar[/]")
     questionary.text("enter untuk lanjut").ask()
 
 def act_auto(accts):
@@ -397,22 +412,37 @@ def act_settle_watch(accts):
 
 def act_send(accts):
     ts = LB.targets(accts)
-    # ambil saldo EDELx (paralel) supaya sender bisa diurutkan dari terbanyak
-    console.print("[dim]memuat saldo EDELx…[/]")
-    refresh_fleet(accts, only_session=False)
-    def av(a):
-        e = FLEET["data"].get(a["email"], {}).get("edelx") or {}
-        return e.get("available", 0.0)
-    ts = sorted(ts, key=av, reverse=True)  # saldo terbanyak di atas
-    labels = [f"{a['email'].split('@')[0]:<22} {av(a):>10.2f} EDELx" for a in ts]
-    picked = questionary.checkbox("Pilih akun SENDER (urut saldo terbanyak; spasi=pilih, enter=lanjut):", choices=labels).ask()
+    # SENDER: pilih cepat TANPA muat saldo 109 akun (lambat). Saldo dicek saat eksekusi (fase 1 bulk_send).
+    load_bal = questionary.confirm("Muat saldo EDELx dulu? (LAMBAT ~semua akun; untuk urut sender by saldo)",
+                                   default=False).ask()
+    if load_bal:
+        console.print("[dim]memuat saldo EDELx…[/]")
+        refresh_fleet(accts, only_session=False)
+        def av(a): return (FLEET["data"].get(a["email"], {}).get("edelx") or {}).get("available", 0.0)
+        ts = sorted(ts, key=av, reverse=True)  # saldo terbanyak di atas
+        labels = [f"{a['email'].split('@')[0]:<22} {av(a):>10.2f} EDELx" for a in ts]
+    else:
+        labels = [a["email"].split("@")[0] for a in ts]
+    picked = questionary.checkbox("Pilih akun SENDER (ketik untuk filter; spasi=pilih, enter=lanjut):",
+                                  choices=labels).ask()
     if not picked: return
     senders = [ts[labels.index(p)]["email"] for p in picked]
-    # target
-    tmode = questionary.select("Kirim ke:", choices=["Semua akun lain", "Pilih email tujuan", "Batal"]).ask()
+    # TARGET: interaktif
+    tmode = questionary.select("Kirim ke:", choices=[
+        "Pilih akun tujuan (checkbox interaktif)", "Semua akun lain (auto, skip settlement — LAMBAT)",
+        "Ketik email manual", "Batal"]).ask()
     if not tmode or tmode == "Batal": return
-    if tmode == "Semua akun lain":
-        # prioritas: saldo terkecil/kosong dulu, skip yang sedang settlement (pakai FLEET yg sudah di-refresh)
+    by_prefix = {a["email"].split("@")[0]: a for a in ts}
+    if tmode.startswith("Pilih akun tujuan"):
+        opts = [p for p in by_prefix if by_prefix[p]["email"] not in senders]
+        chosen = questionary.checkbox("Pilih TUJUAN (ketik untuk filter; spasi=pilih):", choices=opts).ask()
+        if not chosen: return
+        targets = [(by_prefix[c]["email"], by_prefix[c]["hostedPartyId"]) for c in chosen]
+    elif tmode.startswith("Semua akun lain"):
+        # prioritas saldo kecil/kosong dulu, skip settlement (query per-akun → lambat, tapi user pilih)
+        if not FLEET["data"]:
+            console.print("[dim]memuat status fleet untuk skip settlement…[/]")
+            refresh_fleet(accts, only_session=False)
         targets = SB.build_targets_all(accts, senders, fleet=FLEET["data"], log=lambda m: console.print(f"[dim]{m}[/]"))
     else:
         raw = questionary.text("email tujuan (pisah koma):").ask() or ""
