@@ -466,10 +466,19 @@ def act_send(accts):
         bye = {a["email"]: a for a in ts}
         targets = [(e, bye[e]["hostedPartyId"]) for e in tos if e in bye]
     if not targets: console.print("[red]tak ada target[/]"); return
-    amt_s = questionary.text("Nominal EDELx (fixed '110' atau range '100-120', min 100):", default="110").ask()
+    amt_s = questionary.text("Nominal EDELx (fixed '110', range '100-120', atau 'all'=kuras semua saldo sender; min 100):",
+                             default="110").ask()
     spec = SB._parse_amount(amt_s or "110")
-    console.print(f"[orange1]SENDER {len(senders)} → TARGET {len(targets)} | nominal {spec} | min {SB.MIN_WD}[/]")
-    if not questionary.confirm(f"Kirim EDELx ke {len(targets)} target sekarang?", default=False).ask():
+    if spec.get("mode") == "all":
+        keep = questionary.text("Sisakan berapa EDELx di tiap sender? (min-keep, default 0):", default="0").ask()
+        spec["min_keep"] = float(keep or "0")
+    if spec.get("mode") == "all":
+        console.print(f"[orange1]KURAS: {len(senders)} sender → {len(targets)} target | sisakan {spec['min_keep']:.2f}/sender | min {SB.MIN_WD}[/]")
+        prompt = f"KURAS seluruh saldo {len(senders)} sender ke {len(targets)} target sekarang?"
+    else:
+        console.print(f"[orange1]SENDER {len(senders)} → TARGET {len(targets)} | nominal {spec} | min {SB.MIN_WD}[/]")
+        prompt = f"Kirim EDELx ke {len(targets)} target sekarang?"
+    if not questionary.confirm(prompt, default=False).ask():
         return
     res = SB.bulk_send(accts, senders, targets, spec, log=lambda m: (logline(m), console.print(m)))
     ok = sum(1 for _, s, _ in res if s == "ok")

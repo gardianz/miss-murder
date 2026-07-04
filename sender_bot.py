@@ -120,16 +120,30 @@ def bulk_send(accts, sender_emails, targets, amount_spec, ensure_recv=True, work
         for fut in as_completed([ex.submit(prep, s) for s in senders]):
             r = fut.result()
             if r: bal[r[0]] = r[1]; log(f"  sender {r[0].split('@')[0]}: {r[1]:.2f} EDELx")
-    # Fase 2: alokasi greedy (rotasi sender, tanpa network) — pakai saldo di-memori
+    # Fase 2: alokasi (tanpa network) — pakai saldo di-memori
     plan, results = [], []
-    for tgt_email, party in targets:
-        amt = resolve_amount(amount_spec)
-        cand = sorted([e for e in bal if bal[e] >= amt], key=lambda e: bal[e], reverse=True)
-        if not cand:
-            log(f"  → {(tgt_email or party)[:24]}: STOP, semua sender saldo < {amt:.2f}")
-            results.append((tgt_email or party, "no_sender", amt)); break
-        se = cand[0]; bal[se] -= amt
-        plan.append((se, tgt_email, party, amt, f"send:{uuid.uuid4()}"))
+    if amount_spec.get("mode") == "all":
+        # KURAS: tiap sender kirim SELURUH saldo (dikurangi min_keep) ke target (rotasi round-robin).
+        min_keep = float(amount_spec.get("min_keep", 0))
+        if not targets: log("tak ada target"); return []
+        i = 0
+        for se in list(bal.keys()):
+            amt = round(bal[se] - min_keep, 4)
+            if amt < MIN_WD:  # sisa < min transfer (100) → tak bisa kirim
+                log(f"  skip {se.split('@')[0]}: saldo {bal[se]:.2f} < {MIN_WD:.0f}+keep"); continue
+            tgt_email, party = targets[i % len(targets)]; i += 1
+            bal[se] -= amt
+            plan.append((se, tgt_email, party, amt, f"send:{uuid.uuid4()}"))
+        log(f"kuras: {len(plan)} sender → {len(targets)} target (min_keep={min_keep:.2f})")
+    else:
+        for tgt_email, party in targets:
+            amt = resolve_amount(amount_spec)
+            cand = sorted([e for e in bal if bal[e] >= amt], key=lambda e: bal[e], reverse=True)
+            if not cand:
+                log(f"  → {(tgt_email or party)[:24]}: STOP, semua sender saldo < {amt:.2f}")
+                results.append((tgt_email or party, "no_sender", amt)); break
+            se = cand[0]; bal[se] -= amt
+            plan.append((se, tgt_email, party, amt, f"send:{uuid.uuid4()}"))
     # Fase 3: eksekusi transfer PARALEL
     def do(job):
         se, tgt_email, party, amt, idem = job
@@ -156,6 +170,9 @@ def bulk_send(accts, sender_emails, targets, amount_spec, ensure_recv=True, work
 
 # ── CLI langsung ───────────────────────────────────────────────────────
 def _parse_amount(s):
+    s = (s or "").strip()
+    if s.lower() in ("all", "semua", "max", "kuras"):
+        return {"mode": "all", "min_keep": 0}
     if "-" in s:
         lo, hi = s.split("-"); return {"mode": "range", "min": float(lo), "max": float(hi)}
     return {"mode": "fixed", "value": float(s)}
