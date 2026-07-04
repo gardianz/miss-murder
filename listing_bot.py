@@ -34,6 +34,8 @@ def _load_dotenv(path):
 _load_dotenv(os.environ.get("EDEL_ENV") or os.path.join(BASEDIR, ".env"))  # baca .env kalau ada
 
 STATE  = os.environ.get("EDEL_STATE") or os.path.join(BASEDIR, "accounts.json")
+# akun jalur IMPORT COOKIE (dari chrome-extension) disimpan TERPISAH biar tak kecampur akun bot.
+COOKIE_STATE = os.environ.get("EDEL_COOKIE_STATE") or os.path.join(BASEDIR, "accounts_cookie.json")
 LOCK   = STATE + ".lock"
 BASE   = "https://runway.edel.finance"
 ORIGIN = "https://runway.edel.finance"
@@ -52,33 +54,99 @@ def _flock():
         fcntl.flock(f, fcntl.LOCK_UN)
         f.close()
 
-def load_accts(): return json.load(open(STATE)) if os.path.exists(STATE) else []
+def _read_list(fp): return json.load(open(fp)) if os.path.exists(fp) else []
+
+def _atomic_dump(fp, data):
+    """Tulis atomik (tmp + rename). PANGGIL di bawah _flock()."""
+    tmp = fp + ".tmp"
+    json.dump(data, open(tmp, "w"), indent=2)
+    os.replace(tmp, fp)
+
+def _is_cookie_acct(a):
+    """Akun jalur import-cookie: ditandai manual=True dan TAK punya private key (passkey browser)."""
+    return bool(a.get("manual")) and not (a.get("credential") or {}).get("privateKey")
+
+def load_main_accts(): return _read_list(STATE)
+
+def load_cookie_accts():
+    """Akun import-cookie (accounts_cookie.json). Paksa tanda manual=True biar routing tulis konsisten."""
+    accts = _read_list(COOKIE_STATE)
+    for a in accts: a["manual"] = True
+    return accts
+
+def load_accts():
+    """UNION: akun bot (accounts.json) + akun import-cookie (accounts_cookie.json).
+    Dedup by email (akun bot menang — punya private key). Akun cookie bertanda manual=True."""
+    main = load_main_accts()
+    seen = {a.get("email") for a in main}
+    cookie = [a for a in load_cookie_accts() if a.get("email") not in seen]
+    return main + cookie
 
 def save_accts(a):
-    """Atomic write (tmp + rename) di bawah lock."""
+    """Atomic write; PISAH akun bot -> accounts.json, akun import-cookie -> accounts_cookie.json.
+    Jadi memanggil save_accts(union) TIDAK mencampur dua sumber."""
+    main = [x for x in a if not _is_cookie_acct(x)]
+    cookie = [x for x in a if _is_cookie_acct(x)]
     with _flock():
-        tmp = STATE + ".tmp"
-        json.dump(a, open(tmp, "w"), indent=2)
-        os.replace(tmp, STATE)
+        _atomic_dump(STATE, main)
+        if cookie or os.path.exists(COOKIE_STATE):
+            _atomic_dump(COOKIE_STATE, cookie)
 
 def update_account(email, patch):
-    """Read-modify-write 1 akun secara ATOMIK (aman untuk paralel). patch(acct_dict) di-mutate in place."""
+    """Read-modify-write 1 akun secara ATOMIK (aman untuk paralel). patch(acct_dict) di-mutate in place.
+    Routing: cari email di accounts.json dulu, lalu accounts_cookie.json → tulis balik ke FILE yang punya."""
     with _flock():
-        accts = json.load(open(STATE))
-        result = None; hit = None
-        for a in accts:
-            if a["email"] == email:
-                result = patch(a); hit = a; break  # teruskan return patch (mis. _bump_stats -> True kalau baru)
-        tmp = STATE + ".tmp"
-        json.dump(accts, open(tmp, "w"), indent=2)
-        os.replace(tmp, STATE)
-        # SINKRON ke list in-memory (_ACCTS) → dashboard/thread lain lihat perubahan (stats/session) SEKETIKA,
-        # bukan nunggu reload iterasi auto berikut. Replace isi dict yang SAMA (clear+update) biar objek tetap.
-        if hit is not None and _ACCTS is not None:
-            for m in _ACCTS:
-                if m.get("email") == email:
-                    m.clear(); m.update(hit); break
-        return result
+        for fp in (STATE, COOKIE_STATE):
+            if not os.path.exists(fp): continue
+            accts = json.load(open(fp))
+            result = None; hit = None
+            for a in accts:
+                if a["email"] == email:
+                    result = patch(a); hit = a; break  # teruskan return patch (mis. _bump_stats -> True kalau baru)
+            if hit is None: continue
+            _atomic_dump(fp, accts)
+            # SINKRON ke list in-memory (_ACCTS) → dashboard/thread lain lihat perubahan (stats/session) SEKETIKA,
+            # bukan nunggu reload iterasi auto berikut. Replace isi dict yang SAMA (clear+update) biar objek tetap.
+            if _ACCTS is not None:
+                for m in _ACCTS:
+                    if m.get("email") == email:
+                        m.clear(); m.update(hit); break
+            return result
+        return None
+
+def add_cookie_accts(objs, log=print):
+    """Tambah/perbarui akun jalur IMPORT COOKIE ke accounts_cookie.json (TERPISAH dari akun bot).
+    objs: dict tunggal atau list dict berformat chrome-extension (popup.js). Dedup by email
+    (email sama -> update cookie/party). Return (baru, diperbarui)."""
+    if isinstance(objs, dict): objs = [objs]
+    added = updated = 0
+    with _flock():
+        cookie = _read_list(COOKIE_STATE)
+        by_email = {a.get("email"): a for a in cookie}
+        for o in objs:
+            if not isinstance(o, dict): log("  lewati: bukan objek JSON"); continue
+            em = (o.get("email") or "").strip()
+            sess = o.get("session") or {}
+            if not em or "@" not in em or not sess.get("value"):
+                log(f"  lewati: email/cookie tak valid ({em or '?'})"); continue
+            prev = by_email.get(em) or {}
+            rec = {
+                "email": em, "displayName": o.get("displayName"), "ok": True, "manual": True,
+                "proxy": o.get("proxy"), "profileId": o.get("profileId"),
+                "hostedPartyId": o.get("hostedPartyId"),
+                "transferPreapprovalContractId": o.get("transferPreapprovalContractId"),
+                "credVerified": bool(o.get("hostedPartyId")),
+                "session": {"value": sess["value"], "expires": int(sess.get("expires") or 0)},
+                "stats": prev.get("stats") or {"submitted": 0, "windows": []},
+            }
+            if em in by_email:
+                by_email[em].clear(); by_email[em].update(rec); updated += 1
+            else:
+                cookie.append(rec); by_email[em] = rec; added += 1
+            log(f"  {'update' if em in by_email and prev else 'baru'}: {em}"
+                f" party={(rec['hostedPartyId'] or '—')[-9:]}")
+        _atomic_dump(COOKIE_STATE, cookie)
+    return added, updated
 def load_proxies():
     fp = os.path.expanduser("~/.proxies.txt")
     return [l.strip() for l in open(fp)] if os.path.exists(fp) else []

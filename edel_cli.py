@@ -8,7 +8,7 @@ usage:
   python3 edel_cli.py            # menu interaktif
   python3 edel_cli.py dash       # langsung dashboard live
 """
-import sys, os, time, threading, datetime as dt, termios, tty, select
+import sys, os, time, json, threading, datetime as dt, termios, tty, select
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import listing_bot as LB
@@ -208,7 +208,9 @@ def render(accts, sel=0):
         subc = f"[{C_OK}]{sub}[/]" if sub else "[grey37]0[/]"
         rstyle = "black on orange1" if i == sel else None  # highlight baris terpilih
         mark = "▶" if i == sel else " "
-        atab.add_row(mark, em.split("@")[0][:20], party, ses, vf, edx, subc, f"[{fc}]{flabel}[/]", style=rstyle)
+        emname = em.split("@")[0][:18]
+        if LB.is_manual(a): emname = f"{emname} [cyan]🍪[/]"  # tanda akun IMPORT COOKIE
+        atab.add_row(mark, emname, party, ses, vf, edx, subc, f"[{fc}]{flabel}[/]", style=rstyle)
     atab.caption = f"↑/↓ pilih · q keluar    [{sel+1}/{n}]"
 
     # panel bawah: DETAIL + LOG akun terpilih
@@ -219,7 +221,8 @@ def render(accts, sel=0):
         d = Table.grid(padding=(0, 2))
         d.add_column(style=C_KEY, justify="right"); d.add_column(style=C_VAL)
         d.add_column(style=C_KEY, justify="right"); d.add_column(style=C_VAL)
-        d.add_row("Email", em, "Verified", "[green]ya[/]" if a.get("credVerified") is True else "[yellow]?[/]")
+        emlabel = f"{em} [cyan]🍪 import-cookie[/]" if LB.is_manual(a) else em
+        d.add_row("Email", emlabel, "Verified", "[green]ya[/]" if a.get("credVerified") is True else "[yellow]?[/]")
         d.add_row("EDELx avail", f"[orange1]{e.get('available',0):.2f}[/]", "staked", f"{e.get('staked',0):.2f}")
         d.add_row("locked", f"{e.get('locked',0):.2f}", "total", f"{e.get('total',0):.2f}")
         d.add_row("Round", str(live.get("round") or "—"), "Sesi", exp_txt)
@@ -336,6 +339,42 @@ def act_register(accts):
         console.print(f"[orange1]register {n} akun via HTTP…[/]")
         ok = RH.register_batch(n, workers=workers, log=lambda m: (logline(m), console.print(m)))
         console.print(f"[bold green]selesai: {ok}/{n} akun terdaftar[/]")
+    questionary.text("enter untuk lanjut").ask()
+
+def _paste_json_block():
+    """Baca JSON multi-baris dari paste (questionary.text tak dukung newline). Selesai: baris
+    kosong (setelah ada isi) atau ketik END."""
+    console.print("[dim]Paste JSON dari ekstensi (objek {…} atau array [ … ]). "
+                  "Akhiri: baris KOSONG + Enter, atau ketik END:[/]")
+    lines = []
+    while True:
+        try: ln = input()
+        except EOFError: break
+        if ln.strip() == "END": break
+        if ln.strip() == "" and lines: break
+        lines.append(ln)
+    return "\n".join(lines).strip()
+
+def act_import_cookie(accts):
+    """Import akun jalur COOKIE dari chrome-extension. Disimpan TERPISAH di accounts_cookie.json."""
+    console.print("[bold]🍪 Import Akun via Cookie (chrome-extension)[/]")
+    console.print("[dim]Login di runway.edel.finance → buka ekstensi → Ambil → Copy → paste di sini. "
+                  "Bisa satu objek atau array banyak akun. Disimpan di accounts_cookie.json (terpisah).[/]")
+    total_new = total_upd = 0
+    while True:
+        if not questionary.confirm("Tambah akun (paste JSON)?", default=True).ask(): break
+        raw = _paste_json_block()
+        if not raw: console.print("[yellow]kosong — lewati[/]"); continue
+        try: obj = json.loads(raw)
+        except Exception as e: console.print(f"[red]JSON invalid: {str(e)[:100]}[/]"); continue
+        try:
+            new, upd = LB.add_cookie_accts(obj, log=lambda m: console.print(f"[dim]{m}[/]"))
+        except Exception as e: console.print(f"[red]gagal simpan: {str(e)[:100]}[/]"); continue
+        total_new += new; total_upd += upd
+        console.print(f"[green]+{new} baru · {upd} update[/] → accounts_cookie.json")
+    if total_new or total_upd:
+        accts[:] = LB.load_accts(); LB._ACCTS = accts  # refresh union in-memory (bot + cookie)
+        console.print(f"[bold green]selesai: +{total_new} baru · {total_upd} update · total fleet {len(accts)}[/]")
     questionary.text("enter untuk lanjut").ask()
 
 def act_auto(accts):
@@ -502,7 +541,8 @@ def menu():
         pxlabel = "🌐 Proxy: OFF (koneksi langsung)" if LB.NO_PROXY else "🌐 Proxy: ON (pakai proxy akun)"
         choice = questionary.select(
             "EDEL DESK TERMINAL — pilih:",
-            choices=["📊 Dashboard live", "➕ Register Akun (HTTP)", "▶  Jalankan Listing Calls (sekali)",
+            choices=["📊 Dashboard live", "➕ Register Akun (HTTP)", "🍪 Import Akun (cookie ekstensi)",
+                     "▶  Jalankan Listing Calls (sekali)",
                      "🔁 Auto Listing (tiap window)", "💸 Kirim EDELx (bulk)", "🔑 Refresh Sesi",
                      "📈 Riwayat Listing Call", "📋 Status Fleet", "🏦 Party IDs (deposit)", "⏳ Pantau Settlement",
                      pxlabel, "❌ Keluar"],
@@ -515,6 +555,7 @@ def menu():
         accts = LB.load_accts(); LB._ACCTS = accts  # reload state fresh
         if choice.startswith("📊"): dashboard(accts)
         elif choice.startswith("➕"): act_register(accts)
+        elif choice.startswith("🍪"): act_import_cookie(accts)
         elif choice.startswith("▶"): act_run(accts)
         elif choice.startswith("🔁"): act_auto(accts)
         elif choice.startswith("💸"): act_send(accts)
