@@ -65,13 +65,19 @@ def update_account(email, patch):
     """Read-modify-write 1 akun secara ATOMIK (aman untuk paralel). patch(acct_dict) di-mutate in place."""
     with _flock():
         accts = json.load(open(STATE))
-        result = None
+        result = None; hit = None
         for a in accts:
             if a["email"] == email:
-                result = patch(a); break  # teruskan return patch (mis. _bump_stats -> True kalau baru)
+                result = patch(a); hit = a; break  # teruskan return patch (mis. _bump_stats -> True kalau baru)
         tmp = STATE + ".tmp"
         json.dump(accts, open(tmp, "w"), indent=2)
         os.replace(tmp, STATE)
+        # SINKRON ke list in-memory (_ACCTS) → dashboard/thread lain lihat perubahan (stats/session) SEKETIKA,
+        # bukan nunggu reload iterasi auto berikut. Replace isi dict yang SAMA (clear+update) biar objek tetap.
+        if hit is not None and _ACCTS is not None:
+            for m in _ACCTS:
+                if m.get("email") == email:
+                    m.clear(); m.update(hit); break
         return result
 def load_proxies():
     fp = os.path.expanduser("~/.proxies.txt")
