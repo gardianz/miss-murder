@@ -437,10 +437,19 @@ def act_send(accts):
     # TARGET: interaktif
     tmode = questionary.select("Kirim ke:", choices=[
         "Pilih akun tujuan (checkbox interaktif)", "Semua akun lain (auto, skip settlement — LAMBAT)",
-        "Ketik email manual", "Batal"]).ask()
+        "Party ID eksternal (paste)", "Ketik email manual", "Batal"]).ask()
     if not tmode or tmode == "Batal": return
     by_prefix = {a["email"].split("@")[0]: a for a in ts}
-    if tmode.startswith("Pilih akun tujuan"):
+    if tmode.startswith("Party ID eksternal"):
+        raw = questionary.text("Party ID tujuan (pisah koma/spasi/baris; wallet eksternal):").ask() or ""
+        import re
+        pids = [p.strip() for p in re.split(r"[\s,]+", raw) if p.strip()]
+        # target eksternal: email=None (bulk_send skip ensure_recv; penerima aktifkan receiving sendiri)
+        targets = [(None, pid) for pid in pids]
+        if targets:
+            console.print(f"[dim]{len(targets)} party id eksternal:[/] " + ", ".join(p[:16]+'…' for _, p in targets[:5])
+                          + (" …" if len(targets) > 5 else ""))
+    elif tmode.startswith("Pilih akun tujuan"):
         opts = [p for p in by_prefix if by_prefix[p]["email"] not in senders]
         chosen = questionary.checkbox("Pilih TUJUAN (ketik untuk filter; spasi=pilih):", choices=opts).ask()
         if not chosen: return
@@ -460,7 +469,7 @@ def act_send(accts):
     amt_s = questionary.text("Nominal EDELx (fixed '110' atau range '100-120', min 100):", default="110").ask()
     spec = SB._parse_amount(amt_s or "110")
     console.print(f"[orange1]SENDER {len(senders)} → TARGET {len(targets)} | nominal {spec} | min {SB.MIN_WD}[/]")
-    if not questionary.confirm(f"Kirim EDELx ke {len(targets)} akun sekarang?", default=False).ask():
+    if not questionary.confirm(f"Kirim EDELx ke {len(targets)} target sekarang?", default=False).ask():
         return
     res = SB.bulk_send(accts, senders, targets, spec, log=lambda m: (logline(m), console.print(m)))
     ok = sum(1 for _, s, _ in res if s == "ok")
