@@ -412,13 +412,20 @@ def act_settle_watch(accts):
 
 def act_send(accts):
     ts = LB.targets(accts)
-    # SENDER: pilih cepat TANPA muat saldo 109 akun (lambat). Saldo dicek saat eksekusi (fase 1 bulk_send).
-    load_bal = questionary.confirm("Muat saldo EDELx dulu? (LAMBAT ~semua akun; untuk urut sender by saldo)",
+    # SENDER: pilih cepat. Muat saldo pakai fetch_balances (GET /portfolio saja, akun sesi-valid,
+    # workers tinggi) — jauh lebih cepat dari refresh_fleet (yg juga hit /listing-round + login massal).
+    load_bal = questionary.confirm("Muat saldo EDELx untuk urut sender? (cepat: hanya akun sesi valid)",
                                    default=False).ask()
     if load_bal:
-        console.print("[dim]memuat saldo EDELx…[/]")
-        refresh_fleet(accts, only_session=False)
-        def av(a): return (FLEET["data"].get(a["email"], {}).get("edelx") or {}).get("available", 0.0)
+        relogin = questionary.confirm("Sertakan akun sesi MATI juga? (login massal → LAMBAT/throttle)",
+                                      default=False).ask()
+        console.print("[dim]memuat saldo (GET /portfolio)…[/]")
+        t0 = time.time()
+        bal = LB.fetch_balances(accts, workers=48, relogin=bool(relogin),
+                                log=lambda m: console.print(f"[dim]{m}[/]"))
+        nfilled = sum(1 for v in bal.values() if v)
+        console.print(f"[dim]selesai {time.time()-t0:.1f}s · {nfilled} akun ada saldo[/]")
+        def av(a): return (bal.get(a["email"]) or {}).get("available", 0.0)
         ts = sorted(ts, key=av, reverse=True)  # saldo terbanyak di atas
         labels = [f"{a['email'].split('@')[0]:<22} {av(a):>10.2f} EDELx" for a in ts]
     else:

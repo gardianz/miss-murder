@@ -568,6 +568,37 @@ def account_history(acct, accts):
         row["phase"] = phase_from(lr, e)
     return row
 
+def fetch_balances(accts, workers=32, relogin=False, deadline=30, log=None):
+    """Ambil saldo EDELx CEPAT: GET /portfolio SAJA (skip /listing-round → separuh request).
+    relogin=False → lewati akun cookie mati (JANGAN login massal = server throttle login).
+    deadline: batas total detik — akun yang belum balas dilewati (saldo=None) biar waktu terprediksi
+    (tail-latency 1-2 akun lambat tak nge-block). Return {email: {available,locked,staked,total}|None}."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FTimeout
+    ts = targets(accts)
+    if not relogin:
+        ts = [a for a in ts if session_valid(a)]  # cuma sesi valid → api() tak re-login → cepat
+    out = {}; done = 0; tot = len(ts)
+    def one(a):
+        st, pf = api(a, "GET", "/portfolio")
+        e = None
+        if isinstance(pf, dict):
+            b = next((x for x in pf.get("balances", []) if x["instrumentId"] == "EDELx"), None)
+            if b: e = {k: units(b[k]) for k in ("available", "locked", "staked", "total")}
+        return a["email"], e
+    ex = ThreadPoolExecutor(max_workers=max(1, min(workers, tot or 1)))
+    try:
+        futs = [ex.submit(one, a) for a in ts]
+        try:
+            for f in as_completed(futs, timeout=deadline):
+                em, e = f.result(); out[em] = e; done += 1
+                if log and (done % 15 == 0 or done == tot): log(f"  saldo {done}/{tot}")
+        except FTimeout:
+            if log: log(f"  deadline {deadline}s — {done}/{tot} terisi, {tot-done} lambat dilewati")
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)  # jangan blok tunggu straggler
+    for a in ts: out.setdefault(a["email"], None)  # yang kelewat → None
+    return out
+
 def show_history(accts, email=None, live=True):
     """Tabel: berapa listing call berhasil per akun + total keseluruhan. live=cek saldo server."""
     from concurrent.futures import ThreadPoolExecutor
