@@ -130,23 +130,49 @@ def add_cookie_accts(objs, log=print):
             if not em or "@" not in em or not sess.get("value"):
                 log(f"  lewati: email/cookie tak valid ({em or '?'})"); continue
             prev = by_email.get(em) or {}
+            # expiry ASLI dari field 'e' cookie (di-sign server) — bukan tebakan ekstensi
+            tokp = decode_session_cookie(sess["value"]) or {}
+            exp = cookie_expiry(sess["value"], default=int(sess.get("expires") or 0))
+            profid = o.get("profileId") or (tokp.get("p") or {}).get("endUserProfileId")  # autofill dari token
+            left_h = (exp - time.time()) / 3600 if exp else 0
+            if exp and exp <= time.time():
+                log(f"  ⚠ {em}: cookie SUDAH EXPIRED — re-export dulu"); continue
             rec = {
                 "email": em, "displayName": o.get("displayName"), "ok": True, "manual": True,
-                "proxy": o.get("proxy"), "profileId": o.get("profileId"),
+                "proxy": o.get("proxy"), "profileId": profid,
                 "hostedPartyId": o.get("hostedPartyId"),
                 "transferPreapprovalContractId": o.get("transferPreapprovalContractId"),
                 "credVerified": bool(o.get("hostedPartyId")),
-                "session": {"value": sess["value"], "expires": int(sess.get("expires") or 0)},
+                "session": {"value": sess["value"], "expires": exp},
                 "stats": prev.get("stats") or {"submitted": 0, "windows": []},
             }
             if em in by_email:
                 by_email[em].clear(); by_email[em].update(rec); updated += 1
             else:
                 cookie.append(rec); by_email[em] = rec; added += 1
-            log(f"  {'update' if em in by_email and prev else 'baru'}: {em}"
-                f" party={(rec['hostedPartyId'] or '—')[-9:]}")
+            log(f"  {'update' if prev else 'baru'}: {em}"
+                f" party={(rec['hostedPartyId'] or '—')[-9:]} · sisa {left_h:.1f} jam")
         _atomic_dump(COOKIE_STATE, cookie)
     return added, updated
+
+_EXPWARNED = set()  # (email, cookie_value) yang sudah di-alert — dedup lintas reload load_accts()
+def warn_expiring_cookies(accts, log=print, within=1800):
+    """Alert (log + Telegram) SEKALI per cookie untuk akun import-cookie yang mendekati expiry
+    (default 30 mnt). Akun cookie TAK bisa auto-relogin → user harus re-export dari ekstensi."""
+    now = time.time()
+    for a in accts:
+        if not is_manual(a): continue
+        sess = a.get("session") or {}
+        exp = sess.get("expires", 0); val = sess.get("value")
+        if not exp or not val: continue
+        left = exp - now
+        key = (a.get("email"), val)
+        if 0 < left <= within and key not in _EXPWARNED:
+            _EXPWARNED.add(key)
+            mins = int(left / 60)
+            log(f"[cookie] ⚠ {a.get('email')} sisa {mins} mnt — re-export dari ekstensi (tak bisa auto-relogin)")
+            _tg_send(f"⚠️ <b>Cookie akan mati</b> <code>{a.get('email')}</code>\n"
+                     f"sisa ~{mins} menit · re-export dari ekstensi (akun import tak bisa auto-relogin)")
 def load_proxies():
     fp = os.path.expanduser("~/.proxies.txt")
     return [l.strip() for l in open(fp)] if os.path.exists(fp) else []
@@ -247,6 +273,24 @@ def http(acct, method, path, body=None):  # kompat lama
 def session_valid(acct):
     sess = acct.get("session") or {}
     return bool(sess.get("value")) and sess.get("expires", 0) > time.time() + 300
+
+def decode_session_cookie(value):
+    """Cookie edel_session = base64url(JSON).HMAC. Return payload dict {v, p:{endUserProfileId}, e(ms)}
+    atau None. TAK verifikasi signature (butuh secret server) — cuma baca expiry & profileId."""
+    try:
+        payload = (value or "").split(".", 1)[0]
+        pad = payload + "=" * (-len(payload) % 4)
+        d = json.loads(base64.urlsafe_b64decode(pad))
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+def cookie_expiry(value, default=None):
+    """Detik-epoch expiry ASLI dari field 'e' (ms) di dalam cookie bertanda-tangan. Sumber kebenaran
+    (server enforce 'e' yang di-sign). default kalau gagal decode."""
+    p = decode_session_cookie(value)
+    e = (p or {}).get("e")
+    return e / 1000.0 if isinstance(e, (int, float)) else default
 
 def refresh_session(acct, accts, tries=6):
     """Login via HTTP MURNI (Ed25519 sign, tanpa browser) -> simpan cookie edel_session.
@@ -541,6 +585,7 @@ def auto_loop(accts, workers=8, poll_slow=None, poll_fast=None, log=print, stop=
         try:
             accts[:] = load_accts(); _ACCTS = accts  # REPLACE isi list in-place (bukan rebind) →
             # dashboard yang pegang objek `accts` yang SAMA ikut lihat cookie fresh hasil refresh_session
+            warn_expiring_cookies(accts, log=log)  # alert akun import-cookie yang mau mati (tak bisa auto-relogin)
             wid, closes, snow = _window_info(accts)
             AUTO_STATE["window"], AUTO_STATE["server"] = wid, snow
             if wid and wid != last_win:
