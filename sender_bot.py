@@ -13,6 +13,8 @@ import listing_bot as LB
 
 INSTRUMENT = "EDELx"
 MIN_WD = float(os.environ.get("MIN_WD", "100"))  # minimum withdraw/transfer per web = 100
+TRANSFER_RETRIES = int(os.environ.get("TRANSFER_RETRIES", "5"))  # retry saat kontensi ledger Canton
+SETTLE_GAP = float(os.environ.get("SETTLE_GAP", "0.8"))  # jeda antar transfer dari SENDER sama (change-contract siap)
 
 def _err(data): return (data.get("error") or {}).get("code", "") if isinstance(data, dict) else ""
 
@@ -50,6 +52,11 @@ def transfer(sender, to_party, amount, idem, ref=None, log=print):
     if code == "missing_preapproval": return "send_preapproval"
     if "recipient" in code or "receiving" in code or "utility_transfer_preapproval_required" in code:
         return "recv_needed"
+    # KONTENSI LEDGER Canton: holding contract sender lagi dipakai transfer lain (in-flight) atau referensi
+    # basi (sudah diarsip transfer sebelumnya). RETRYABLE — cukup serial per sender + tunggu change-contract.
+    if ("locked_contract" in code or "in_flight" in code or "inactive_contract" in code
+            or "contract_not_found" in code):
+        return "locked_contract"
     log(f"  [{sender['email']}] transfer gagal: {st} {code}")
     return "fail"
 
@@ -144,26 +151,43 @@ def bulk_send(accts, sender_emails, targets, amount_spec, ensure_recv=True, work
                 results.append((tgt_email or party, "no_sender", amt)); break
             se = cand[0]; bal[se] -= amt
             plan.append((se, tgt_email, party, amt, f"send:{uuid.uuid4()}"))
-    # Fase 3: eksekusi transfer PARALEL
-    def do(job):
+    # Fase 3: eksekusi. Transfer dari SENDER yang SAMA harus SERIAL (Canton = holding contract tunggal;
+    # paralel → rebutan contract → local_verdict_locked_contracts). Paralelkan ANTAR sender saja.
+    def one(job):
         se, tgt_email, party, amt, idem = job
         sender = by_email[se]
         if ensure_recv and tgt_email and tgt_email in by_email:
             ensure_recv_preapproval(by_email[tgt_email], log)
-        status = transfer(sender, party, amt, idem, log=log)
-        if status == "send_preapproval":
-            ensure_send_preapproval(sender, log); status = transfer(sender, party, amt, idem, log=log)
-        if status == "recv_needed" and tgt_email and tgt_email in by_email:
-            if ensure_recv_preapproval(by_email[tgt_email], log):
-                status = transfer(sender, party, amt, idem, log=log)
+        status = "fail"
+        for attempt in range(TRANSFER_RETRIES):
+            status = transfer(sender, party, amt, idem, log=log)
+            if status == "send_preapproval":
+                ensure_send_preapproval(sender, log); status = transfer(sender, party, amt, idem, log=log)
+            if status == "recv_needed" and tgt_email and tgt_email in by_email:
+                if ensure_recv_preapproval(by_email[tgt_email], log):
+                    status = transfer(sender, party, amt, idem, log=log)
+            if status == "locked_contract":  # kontensi ledger — tunggu change-contract settle, ULANG (idem sama)
+                time.sleep(SETTLE_GAP + attempt * 0.7)
+                continue
+            break
         tag = (tgt_email or party).split("@")[0][:18]
         if status == "ok": log(f"  ✓ {se.split('@')[0]} → {tag}  {amt:.2f} EDELx")
         else: log(f"  ✗ {se.split('@')[0]} → {tag}: {status}")
         return (tgt_email or party, status, amt)
+    def run_sender(jobs):
+        out = []
+        for j in jobs:
+            out.append(one(j))
+            time.sleep(SETTLE_GAP)  # beri jeda agar change-contract sender siap sebelum transfer berikut
+        return out
     if plan:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            for fut in as_completed([ex.submit(do, j) for j in plan]):
-                results.append(fut.result())
+        from collections import defaultdict
+        by_sender = defaultdict(list)
+        for j in plan: by_sender[j[0]].append(j)
+        log(f"eksekusi: {len(plan)} transfer, {len(by_sender)} sender (serial per sender, paralel antar sender)")
+        with ThreadPoolExecutor(max_workers=min(workers, len(by_sender))) as ex:
+            for fut in as_completed([ex.submit(run_sender, js) for js in by_sender.values()]):
+                results.extend(fut.result())
     ok = sum(1 for _, s, _ in results if s == "ok")
     log(f"[selesai] {ok}/{len(results)} transfer sukses")
     return results
