@@ -189,6 +189,7 @@ def _proxy_dict(proxy):
 # timeout (connect, read): connect pendek supaya proxy mati cepat gagal & dirotasi
 HTTP_TIMEOUT = (float(os.environ.get("HTTP_CONNECT_TO", "4")), float(os.environ.get("HTTP_READ_TO", "11")))
 API_DEADLINE = float(os.environ.get("API_DEADLINE", "40"))  # budget total per request (detik) — retry proxy sampai budget habis
+RUN_JITTER = float(os.environ.get("RUN_JITTER", "3"))  # sebar start tiap akun (detik acak) — hindari burst 429 nginx (window 6 jam = tak buru-buru)
 
 # ── Telegram alert (opsional) — aktif kalau TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID di-set ──
 import threading
@@ -225,7 +226,10 @@ def _raw_http(cookie, proxy, method, path, body, timeout=HTTP_TIMEOUT):
         r = s.request(method, BASE + path, json=body, proxies=_proxy_dict(proxy), timeout=timeout)
         try: data = r.json()
         except Exception: data = r.text
-        return r.status_code, data, None
+        ra = r.headers.get("Retry-After")  # detik (int) atau HTTP-date; kita pakai kalau angka
+        try: ra = float(ra) if ra else None
+        except Exception: ra = None
+        return r.status_code, data, ra
     except Exception as e:
         return "ERR", str(e)[:100], None
 
@@ -246,12 +250,18 @@ def api(acct, method, path, body=None, retries=5, auth=True):
     while time.time() - t0 <= API_DEADLINE:
         attempt += 1
         cookie = (acct.get("session") or {}).get("value") if auth else None
-        st, data, _ = _raw_http(cookie, proxy, method, path, body)
+        st, data, ra = _raw_http(cookie, proxy, method, path, body)
         if st == "ERR":
             last = data
             # proxy/jaringan gagal -> langsung rotasi proxy & coba lagi (jeda kecil saja)
             if alt_proxies: proxy = random.choice(alt_proxies)
             time.sleep(0.3)
+            continue
+        if st == 429:  # nginx RATE-LIMIT (banyak akun 1 IP / burst). Backoff + jitter, HORMATI Retry-After.
+            last = "429"                       # tanpa ini 429 = gagal instan (bug: "buka round gagal: ERR")
+            base = ra if (ra is not None) else min(1.5 ** min(attempt, 6), 8)
+            if alt_proxies: proxy = random.choice(alt_proxies)  # sebar IP kalau ada proxy
+            time.sleep(base + random.uniform(0, 1.5))  # jitter anti-thundering-herd (100+ akun retry serempak)
             continue
         if st in (401, 403) and auth:
             if relogin_count < 3:
@@ -652,6 +662,7 @@ def run_all(accts, emails=None, workers=8, log=print, stop=None):
     results = {}
     def worker(a):
         if stop and stop.is_set(): return a["email"], "stopped"
+        if RUN_JITTER: time.sleep(random.uniform(0, RUN_JITTER))  # de-sync burst → kurangi 429
         try: return a["email"], do_listing(a, accts, rankmap, log=log)
         except Exception as e: log(f"[{a['email']}] error: {str(e)[:100]}"); return a["email"], "fail"
     ex = ThreadPoolExecutor(max_workers=workers)
