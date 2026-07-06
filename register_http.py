@@ -86,6 +86,7 @@ def tempik_inbox(local):
     except Exception: pass
 
 NO_PROXY = os.environ.get("NO_PROXY", "").lower() in ("1", "true", "yes", "on")
+REG_JITTER = float(os.environ.get("REG_JITTER", "2"))  # sebar tiap worker biar tak spam back-to-back
 
 def register_one(email, display, proxy, tries=6):
     proxies = None if NO_PROXY else ({"http": proxy, "https": proxy} if proxy else None)
@@ -167,6 +168,7 @@ def register_batch(n, workers=4, log=print):
     ok = 0
     def one(job):
         email, display, local, proxy = job
+        if REG_JITTER: time.sleep(random.uniform(0, REG_JITTER))  # jeda acak, hindari burst serempak
         tempik_inbox(local)
         return register_one(email, display, proxy)
     with ThreadPoolExecutor(max_workers=workers) as ex:
