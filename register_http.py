@@ -87,6 +87,7 @@ def tempik_inbox(local):
 
 NO_PROXY = os.environ.get("NO_PROXY", "").lower() in ("1", "true", "yes", "on")
 REG_JITTER = float(os.environ.get("REG_JITTER", "2"))  # sebar tiap worker biar tak spam back-to-back
+REG_ACCESS_CODE = os.environ.get("REG_ACCESS_CODE", "").strip()  # wajib: server tolak register tanpa accessCode valid
 
 def register_one(email, display, proxy, tries=6):
     proxies = None if NO_PROXY else ({"http": proxy, "https": proxy} if proxy else None)
@@ -102,8 +103,17 @@ def register_one(email, display, proxy, tries=6):
             time.sleep(2)
         return None
     # 1) start
-    r = post("/auth/register/start", {"email": email, "displayName": display})
-    if not r or r.status_code != 200: return {"ok": False, "email": email, "why": f"start {r.status_code if r else 'ERR'}"}
+    start_body = {"email": email, "displayName": display}
+    if REG_ACCESS_CODE: start_body["accessCode"] = REG_ACCESS_CODE
+    r = post("/auth/register/start", start_body)
+    if not r or r.status_code != 200:
+        why = f"start {r.status_code if r else 'ERR'}"
+        if r is not None:
+            try:
+                code = r.json().get("error", {}).get("code", "")
+                if code: why += f" {code}"
+            except Exception: pass
+        return {"ok": False, "email": email, "why": why}
     opts = r.json()["options"]
     challenge = opts["challenge"]; rp_id = opts["rp"]["id"]
     # 2) keypair Ed25519 + credential
