@@ -22,12 +22,17 @@ BASEDIR = os.path.dirname(os.path.abspath(__file__))  # portabel: relatif ke lok
 ENGINE = os.path.join(BASEDIR, "engine")
 
 def _load_dotenv(path):
-    """Muat KEY=VALUE dari file .env ke os.environ (tanpa override env yang sudah di-set). Tanpa dependency."""
+    """Muat KEY=VALUE dari file .env ke os.environ (tanpa override env yang sudah di-set). Tanpa dependency.
+    Strip komentar inline ' # …' pada value TAK-berkutip (biar `KEY=val  # ket` → 'val')."""
     try:
         for line in open(path):
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line: continue
             k, v = line.split("=", 1)
+            v = v.strip()
+            if v[:1] not in ("'", '"'):          # value tak dikutip → potong komentar inline
+                for sep in (" #", "\t#"):
+                    if sep in v: v = v.split(sep, 1)[0].rstrip()
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     except Exception:
         pass
