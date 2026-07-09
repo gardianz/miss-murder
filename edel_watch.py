@@ -39,7 +39,7 @@ jalan:
   python3 edel_watch.py --test "edel::...\nVZR57MP7P8"   # tes regex extract (offline)
   python3 edel_watch.py --code edel::xxxx  # register 1 kode manual (tanpa telegram)
 """
-import os, sys, re, json, random, asyncio, functools
+import os, sys, re, json, random, asyncio, functools, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASEDIR = os.path.dirname(os.path.abspath(__file__))
@@ -81,6 +81,7 @@ USES       = int(os.environ.get("EDEL_CODE_USES", "1") or "1")   # akun per kode
 PROBE      = os.environ.get("EDEL_PROBE", "").lower() in ("1", "true", "yes", "on")
 WORKERS    = int(os.environ.get("REG_WORKERS", "4") or "4")      # floor paralel (dipakai kalau > jumlah kode)
 MAXPAR     = int(os.environ.get("EDEL_WATCH_MAXPAR", "24") or "24")  # cap thread paralel (anti spawn ratusan)
+PREWARM    = int(os.environ.get("EDEL_PREWARM", "16") or "16")   # identitas pre-gen sebelum kode drop
 CATCHUP    = int(os.environ.get("EDEL_TG_CATCHUP", "0") or "0")
 POLL       = float(os.environ.get("EDEL_TG_POLL", "1.0") or "1.0")
 POLL_LIMIT = int(os.environ.get("EDEL_TG_POLL_LIMIT", "3") or "3")
@@ -100,6 +101,33 @@ _CUSTOM_RE  = os.environ.get("EDEL_CODE_RE", "").strip()
 RE_CUSTOM   = re.compile(_CUSTOM_RE) if _CUSTOM_RE else None
 
 _seen = set()   # dedup kode sudah diproses (persist watch_seen.json)
+_pool = []      # identitas siap-pakai [(email, display)] — di-gen SEBELUM kode drop
+_pool_lock = threading.Lock()
+
+
+def _prewarm_pool(n):
+    """Isi pool identitas unik sampai n (generate SEBELUM kode drop → klaim instan)."""
+    with RH._flock():
+        existing = {a["email"].split("@")[0]
+                    for a in (json.load(open(RH.STATE)) if os.path.exists(RH.STATE) else [])}
+    with _pool_lock:
+        existing |= {e.split("@")[0] for e, _ in _pool}
+        while len(_pool) < n:
+            local = RH.gen_local(existing); existing.add(local)
+            _pool.append((f"{local}@weling.web.id",
+                          random.choice(RH.NAMES) + str(random.randint(100, 999))))
+        return len(_pool)
+
+
+def _take_identity(existing):
+    """Ambil 1 identitas dari pool (instan) atau generate baru (fallback). Cek tak tabrakan."""
+    with _pool_lock:
+        while _pool:
+            email, display = _pool.pop()
+            if email.split("@")[0] not in existing:
+                existing.add(email.split("@")[0]); return email, display
+    local = RH.gen_local(existing); existing.add(local)
+    return f"{local}@weling.web.id", random.choice(RH.NAMES) + str(random.randint(100, 999))
 
 
 def _load_seen():
@@ -216,12 +244,11 @@ def _register_codes_blocking(codes):
     with RH._flock():
         existing = {a["email"].split("@")[0]
                     for a in (json.load(open(RH.STATE)) if os.path.exists(RH.STATE) else [])}
-    jobs = []   # (email, display, code)
+    jobs = []   # (email, display, code) — ambil identitas dari pool (instan) kalau ada
     for code in codes:
         for _ in range(max(1, USES)):
-            local = RH.gen_local(existing); existing.add(local)
-            jobs.append((f"{local}@weling.web.id",
-                         random.choice(RH.NAMES) + str(random.randint(100, 999)), code))
+            email, display = _take_identity(existing)
+            jobs.append((email, display, code))
     # paralel = jumlah job (1 thread/kode), di-cap MAXPAR. Floor REG_WORKERS kalau job sedikit.
     par = max(1, min(len(jobs), MAXPAR), min(WORKERS, len(jobs)))
     results, ok = [], 0
@@ -235,14 +262,17 @@ def _register_codes_blocking(codes):
 
 
 async def process(client, codes, src="", force=False):
-    """Proses kode baru: dedup, (opsional probe), register paralel, notif hasil."""
+    """Proses kode baru: dedup ATOMIK → FIRE register secepatnya → notif/disk/refill belakangan.
+    HOT PATH: jangan await notif/disk/probe sebelum tembak register (buang ratusan ms)."""
+    # dedup atomik (asyncio single-thread; tak ada await antara cek & mark) — push & poll bisa
+    # lihat kode sama nyaris barengan; yg pertama klaim, kedua dapat fresh kosong.
     fresh = list(codes) if force else [c for c in codes if c not in _seen]
     if not fresh:
         return
     for c in fresh:
         _seen.add(c)
-    _save_seen()
-    if PROBE:
+    loop = asyncio.get_event_loop()
+    if PROBE:   # opt-in (LAMBAT + bisa konsumsi kode single-use) — off by default
         checked = []
         for c in fresh:
             ok, why = probe_code(c)
@@ -252,12 +282,15 @@ async def process(client, codes, src="", force=False):
                 checked.append(c)
         fresh = checked
         if not fresh:
-            return
-    await notify(client, f"🔔 {len(fresh)} kode baru dari <b>{src}</b> → register "
-                         f"({USES} akun/kode)…\n" + "\n".join(fresh[:20]))
+            _save_seen(); return
+    # FIRE register DULUAN — sebelum notif/disk (klaim = aksi tercepat, menang balapan)
+    fut = loop.run_in_executor(None, functools.partial(_register_codes_blocking, fresh))
+    asyncio.create_task(notify(client, f"🔔 {len(fresh)} kode baru dari <b>{src}</b> → register "
+                                       f"({USES} akun/kode)…\n" + "\n".join(fresh[:20])))
+    _save_seen()
+    loop.run_in_executor(None, _prewarm_pool, PREWARM)   # isi ulang pool buat drop berikut
     try:
-        loop = asyncio.get_event_loop()
-        res = await loop.run_in_executor(None, functools.partial(_register_codes_blocking, fresh))
+        res = await fut
     except Exception as e:
         await notify(client, f"❌ error register: {e}")
         return
@@ -348,8 +381,12 @@ async def amain():
     names = ", ".join(t for _, t in chans)
     print(f"login sbg {me.first_name} (id {me.id}). Pantau {len(chans)} channel: {names}. "
           f"{USES} akun/kode. Notif → {'bot' if (BOT_TOKEN and BOT_CHAT) else NOTIFY}")
+    # optimasi FCFS: warm koneksi TLS + pre-gen identitas SEBELUM kode drop
+    RH.warm_connections(min(PREWARM, 12), log=print)
+    npool = _prewarm_pool(PREWARM)
+    print(f"prewarm {npool} identitas siap-pakai + koneksi TLS warm (poll {POLL}s).")
     await notify(client, f"👀 Edel watcher aktif. Pantau <b>{names}</b>. "
-                         f"Access code auto-register ({USES} akun/kode).")
+                         f"Access code auto-register ({USES} akun/kode, {npool} prewarm, poll {POLL}s).")
 
     @client.on(events.NewMessage(chats=[e for e, _ in chans]))
     async def _(event):

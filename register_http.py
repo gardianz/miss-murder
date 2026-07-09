@@ -8,7 +8,7 @@ usage:
   python3 register_http.py --until M   # loop register sampai TOTAL akun >= M
   python3 register_http.py --selftest  # validasi builder CBOR vs data tertangkap
 """
-import os, sys, json, time, uuid, hashlib, base64, secrets, random, fcntl
+import os, sys, json, time, uuid, hashlib, base64, secrets, random, fcntl, threading
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
@@ -89,11 +89,43 @@ NO_PROXY = os.environ.get("NO_PROXY", "").lower() in ("1", "true", "yes", "on")
 REG_JITTER = float(os.environ.get("REG_JITTER", "2"))  # sebar tiap worker biar tak spam back-to-back
 REG_ACCESS_CODE = os.environ.get("REG_ACCESS_CODE", "").strip()  # wajib: server tolak register tanpa accessCode valid
 
+_REG_HDR = {"Accept": "application/json", "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0", "Origin": ORIGIN, "Referer": ORIGIN + "/register"}
+_SHARED = None
+_SHARED_LOCK = threading.Lock()
+
+def shared_session():
+    """Session HTTP bersama dgn connection-pool keep-alive (TLS reuse) — jalur no-proxy FCFS.
+    Hemat handshake TLS ~100-300ms per klaim setelah koneksi warm."""
+    global _SHARED
+    if _SHARED is None:
+        with _SHARED_LOCK:
+            if _SHARED is None:
+                s = requests.Session()
+                ad = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=0)
+                s.mount("https://", ad); s.mount("http://", ad)
+                s.headers.update(_REG_HDR)
+                _SHARED = s
+    return _SHARED
+
+def warm_connections(n=8, log=None):
+    """Pre-open n koneksi TLS keep-alive ke server (isi pool) biar wave pertama tak handshake."""
+    s = shared_session()
+    def ping():
+        try: s.get(BASE + "/register", timeout=10)
+        except Exception: pass
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        list(ex.map(lambda _: ping(), range(n)))
+    if log: log(f"[warm] {n} koneksi TLS keep-alive siap")
+
 def register_one(email, display, proxy, tries=6, access_code=None):
-    proxies = None if NO_PROXY else ({"http": proxy, "https": proxy} if proxy else None)
-    s = requests.Session()
-    s.headers.update({"Accept": "application/json", "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0", "Origin": ORIGIN, "Referer": ORIGIN + "/register"})
+    use_shared = NO_PROXY or not proxy       # no-proxy → session warm bersama (TLS keep-alive)
+    if use_shared:
+        s = shared_session(); proxies = None
+    else:
+        s = requests.Session()
+        s.headers.update(_REG_HDR)
+        proxies = {"http": proxy, "https": proxy}
     def post(path, body):
         for _ in range(tries):
             try:
