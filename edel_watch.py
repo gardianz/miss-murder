@@ -20,7 +20,8 @@ kamu ikuti TANPA jadi admin. Login HP sekali (watch.session), lalu headless.
 env (.env):
   EDEL_TG_API_ID    api_id  dari https://my.telegram.org  (wajib)
   EDEL_TG_API_HASH  api_hash dari https://my.telegram.org (wajib)
-  EDEL_TG_WATCH     channel/grup dipantau (default: handlpay). @user, id, atau link.
+  EDEL_TG_WATCH     channel/grup dipantau, PISAH KOMA buat multi (default:
+                    handlpay,oneswap_community,edeldotfinance). @user, id, atau link.
   EDEL_TG_NOTIFY    tujuan notif kalau tanpa bot (default: me = Saved Messages).
   EDEL_CODE_USES    berapa akun di-register per kode (default 1; naikkan kalau 1 kode multi-pakai).
   EDEL_PROBE        1 = cek kode dulu (register/start, tak finish) sebelum register.
@@ -70,7 +71,8 @@ except ImportError:
 
 API_ID     = os.environ.get("EDEL_TG_API_ID", "").strip()
 API_HASH   = os.environ.get("EDEL_TG_API_HASH", "").strip()
-WATCH      = os.environ.get("EDEL_TG_WATCH", "handlpay").strip() or "handlpay"
+_WATCH_RAW = os.environ.get("EDEL_TG_WATCH", "handlpay,oneswap_community,edeldotfinance").strip()
+WATCHES    = [w for w in re.split(r"[\s,]+", _WATCH_RAW) if w] or ["handlpay"]  # multi-channel
 NOTIFY     = os.environ.get("EDEL_TG_NOTIFY", "me").strip() or "me"
 USES       = int(os.environ.get("EDEL_CODE_USES", "1") or "1")   # akun per kode
 PROBE      = os.environ.get("EDEL_PROBE", "").lower() in ("1", "true", "yes", "on")
@@ -256,24 +258,26 @@ async def process(client, codes, src="", force=False):
                          f"Total akun: {res['total']}.\n" + ("\n".join(lines[:25]) or "(tak ada)"))
 
 
-async def poller(client, title):
-    """Poll getHistory tiap POLL detik — deteksi kode tanpa nunggu push MTProto (bisa telat)."""
+async def poller(client, chans):
+    """Poll getHistory tiap POLL detik untuk SEMUA channel — deteksi kode tanpa nunggu push
+    MTProto (bisa telat). chans: list (entity, title)."""
     if POLL <= 0:
         return
     from telethon.errors import FloodWaitError
-    print(f"poller aktif: getHistory tiap {POLL}s (limit {POLL_LIMIT}).")
+    print(f"poller aktif: getHistory tiap {POLL}s (limit {POLL_LIMIT}) × {len(chans)} channel.")
     while True:
-        try:
-            msgs = await client.get_messages(WATCH, limit=POLL_LIMIT)
-            codes = []
-            for m in reversed(msgs or []):
-                codes += extract_codes(m.message or "")
-            if codes:
-                await process(client, codes, src=title + " (poll)")
-        except FloodWaitError as e:
-            print(f"poll FloodWait {e.seconds}s — mundur"); await asyncio.sleep(e.seconds + 1); continue
-        except Exception as e:
-            print("poll err:", e)
+        for ent, title in chans:
+            try:
+                msgs = await client.get_messages(ent, limit=POLL_LIMIT)
+                codes = []
+                for m in reversed(msgs or []):
+                    codes += extract_codes(m.message or "")
+                if codes:
+                    await process(client, codes, src=title + " (poll)")
+            except FloodWaitError as e:
+                print(f"poll FloodWait {e.seconds}s @ {title} — mundur"); await asyncio.sleep(e.seconds + 1)
+            except Exception as e:
+                print(f"poll err @ {title}:", e)
         await asyncio.sleep(POLL)
 
 
@@ -300,18 +304,19 @@ async def notify(client, text):
         print("notify err:", e)
 
 
-async def catchup(client):
+async def catchup(client, chans):
     if CATCHUP <= 0:
         return
-    print(f"catchup: scan {CATCHUP} pesan terakhir @ {WATCH}…")
-    all_codes = []
-    async for msg in client.iter_messages(WATCH, limit=CATCHUP):
-        all_codes += extract_codes(msg.message or "")
-    all_codes = list(dict.fromkeys(all_codes))
-    new = [c for c in all_codes if c not in _seen]
-    print(f"catchup: {len(all_codes)} kode ({len(new)} baru).")
-    if new:
-        await process(client, new, src=f"{WATCH} (catchup)")
+    for ent, title in chans:
+        print(f"catchup: scan {CATCHUP} pesan terakhir @ {title}…")
+        all_codes = []
+        async for msg in client.iter_messages(ent, limit=CATCHUP):
+            all_codes += extract_codes(msg.message or "")
+        all_codes = list(dict.fromkeys(all_codes))
+        new = [c for c in all_codes if c not in _seen]
+        print(f"catchup {title}: {len(all_codes)} kode ({len(new)} baru).")
+        if new:
+            await process(client, new, src=f"{title} (catchup)")
 
 
 async def amain():
@@ -321,22 +326,32 @@ async def amain():
     client = TelegramClient(SESSION, int(API_ID), API_HASH)
     await client.start()  # first run: nomor HP + OTP telegram (interaktif)
     me = await client.get_me()
-    ent = await client.get_entity(WATCH)
-    title = getattr(ent, "title", None) or getattr(ent, "username", WATCH)
-    print(f"login sbg {me.first_name} (id {me.id}). Pantau: {title}. {USES} akun/kode. "
-          f"Notif → {'bot' if (BOT_TOKEN and BOT_CHAT) else NOTIFY}")
-    await notify(client, f"👀 Edel watcher aktif. Pantau <b>{title}</b>. "
+    from telethon import utils
+    chans, title_by_id = [], {}
+    for w in WATCHES:
+        try:
+            ent = await client.get_entity(w)
+            title = getattr(ent, "title", None) or getattr(ent, "username", w)
+            chans.append((ent, title)); title_by_id[utils.get_peer_id(ent)] = title
+        except Exception as e:
+            print(f"⚠️ skip channel '{w}': {e}")
+    if not chans:
+        print("Tak ada channel valid (cek EDEL_TG_WATCH & keanggotaan akun)."); return
+    names = ", ".join(t for _, t in chans)
+    print(f"login sbg {me.first_name} (id {me.id}). Pantau {len(chans)} channel: {names}. "
+          f"{USES} akun/kode. Notif → {'bot' if (BOT_TOKEN and BOT_CHAT) else NOTIFY}")
+    await notify(client, f"👀 Edel watcher aktif. Pantau <b>{names}</b>. "
                          f"Access code auto-register ({USES} akun/kode).")
 
-    @client.on(events.NewMessage(chats=WATCH))
+    @client.on(events.NewMessage(chats=[e for e, _ in chans]))
     async def _(event):
         codes = extract_codes(event.message.message or "")
         if codes:
-            await process(client, codes, src=title)
+            await process(client, codes, src=title_by_id.get(event.chat_id, "?"))
 
-    await catchup(client)
+    await catchup(client, chans)
     print("listening (push handler + poller)… (Ctrl-C keluar)")
-    ptask = asyncio.create_task(poller(client, title))
+    ptask = asyncio.create_task(poller(client, chans))
     try:
         await client.run_until_disconnected()
     finally:

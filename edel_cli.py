@@ -384,14 +384,16 @@ def act_watch(accts):
         console.print("[red]EDEL_TG_API_ID / EDEL_TG_API_HASH belum di-set di .env[/] "
                       "[dim](ambil di https://my.telegram.org)[/]")
         questionary.text("enter untuk lanjut").ask(); return
-    ch = questionary.text("channel/grup dipantau:", default=EW.WATCH).ask()
+    import re as _re
+    ch = questionary.text("channel/grup dipantau (pisah koma buat multi):",
+                          default=", ".join(EW.WATCHES)).ask()
     if not ch: return
-    EW.WATCH = ch.strip()
+    EW.WATCHES = [w for w in _re.split(r"[\s,]+", ch) if w] or EW.WATCHES
     EW.USES = int(questionary.text("akun di-register per kode:", default=str(EW.USES)).ask() or str(EW.USES))
     catch = int(questionary.text("scan N pesan terakhir dulu (catchup, 0=tidak):", default="0").ask() or "0")
     EW.CATCHUP = catch
     notif = "bot alert" if (EW.BOT_TOKEN and EW.BOT_CHAT) else f"Telethon '{EW.NOTIFY}'"
-    console.print(f"[orange1]Watcher: pantau {EW.WATCH}, {EW.USES} akun/kode, notif {notif}. "
+    console.print(f"[orange1]Watcher: pantau {', '.join(EW.WATCHES)}, {EW.USES} akun/kode, notif {notif}. "
                   f"Ctrl-C untuk berhenti.[/]\n[dim]First-run minta nomor HP + OTP Telegram (sekali).[/]")
     try:
         asyncio.run(EW.amain())
