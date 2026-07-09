@@ -74,7 +74,8 @@ WATCH      = os.environ.get("EDEL_TG_WATCH", "handlpay").strip() or "handlpay"
 NOTIFY     = os.environ.get("EDEL_TG_NOTIFY", "me").strip() or "me"
 USES       = int(os.environ.get("EDEL_CODE_USES", "1") or "1")   # akun per kode
 PROBE      = os.environ.get("EDEL_PROBE", "").lower() in ("1", "true", "yes", "on")
-WORKERS    = int(os.environ.get("REG_WORKERS", "4") or "4")
+WORKERS    = int(os.environ.get("REG_WORKERS", "4") or "4")      # floor paralel (dipakai kalau > jumlah kode)
+MAXPAR     = int(os.environ.get("EDEL_WATCH_MAXPAR", "24") or "24")  # cap thread paralel (anti spawn ratusan)
 CATCHUP    = int(os.environ.get("EDEL_TG_CATCHUP", "0") or "0")
 POLL       = float(os.environ.get("EDEL_TG_POLL", "1.0") or "1.0")
 POLL_LIMIT = int(os.environ.get("EDEL_TG_POLL_LIMIT", "3") or "3")
@@ -168,21 +169,29 @@ def probe_code(code):
     return False, why
 
 
-def _register_with_code(existing, code):
-    """Register 1 akun dgn access code spesifik. `edel::uuid` ditolak → coba lagi uuid
-    telanjang. Return (ok, email, why). existing: set localpart terpakai (mutasi in-place)."""
-    local = RH.gen_local(existing); existing.add(local)
-    email = f"{local}@weling.web.id"
-    display = random.choice(RH.NAMES) + str(random.randint(100, 999))
-    proxies = RH.load_proxies()
-    proxy = random.choice(proxies) if proxies else None
-    RH.tempik_inbox(local)
+def _register_job(email, display, code):
+    """Register 1 akun (identitas sudah dipesan). `edel::uuid` ditolak → coba lagi uuid
+    telanjang. Return (ok, email, why).
+
+    proxy=None SELALU: redeem FCFS → koneksi langsung paling cepat (proxy nambah hop/latency).
+    Simpan akun HANYA kalau data passkey LENGKAP (privateKey wajib — tanpa itu akun tak bisa
+    login/refresh selamanya). Kalau privateKey hilang, akun tetap didump ke accounts_incomplete.json
+    agar tak lenyap, tapi ditandai gagal biar kelihatan."""
+    RH.tempik_inbox(email.split("@")[0])
     tries = [code] + ([code.split("::", 1)[1]] if "::" in code else [])
     why = "?"
     for c in tries:
-        res = RH.register_one(email, display, proxy, access_code=c)
+        res = RH.register_one(email, display, None, access_code=c)  # proxy=None → FCFS langsung
         if res.get("ok"):
-            RH._append_account(res)
+            cred = res.get("credential") or {}
+            if not cred.get("privateKey"):
+                # akun ke-create di server tapi keypair hilang → JANGAN buang; dump mentah.
+                try:
+                    with open(os.path.join(BASEDIR, "accounts_incomplete.json"), "a") as f:
+                        f.write(json.dumps(res) + "\n")
+                except OSError: pass
+                return False, email, "OK_BUT_NO_PRIVATEKEY(cek accounts_incomplete.json)"
+            RH._append_account(res)   # atomik (_flock) → accounts.json lengkap: privateKey+publicKey+credId
             return True, email, "OK"
         why = res.get("why", "?")
         if "INVALID" not in why.upper():   # bukan soal kode → tak usah coba varian lain
@@ -192,14 +201,22 @@ def _register_with_code(existing, code):
 
 def _register_codes_blocking(codes):
     """Register PARALEL: tiap kode → USES akun (default 1). Return summary dict.
-    existing di-baca sekali di bawah _flock biar localpart tak tabrakan."""
+    Identitas (email unik) DI-GENERATE DULU serial (di bawah _flock) sebelum spawn thread —
+    hindari race localpart dobel antar thread."""
     with RH._flock():
         existing = {a["email"].split("@")[0]
                     for a in (json.load(open(RH.STATE)) if os.path.exists(RH.STATE) else [])}
-    jobs = [c for c in codes for _ in range(max(1, USES))]
+    jobs = []   # (email, display, code)
+    for code in codes:
+        for _ in range(max(1, USES)):
+            local = RH.gen_local(existing); existing.add(local)
+            jobs.append((f"{local}@weling.web.id",
+                         random.choice(RH.NAMES) + str(random.randint(100, 999)), code))
+    # paralel = jumlah job (1 thread/kode), di-cap MAXPAR. Floor REG_WORKERS kalau job sedikit.
+    par = max(1, min(len(jobs), MAXPAR), min(WORKERS, len(jobs)))
     results, ok = [], 0
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futs = {ex.submit(_register_with_code, existing, c): c for c in jobs}
+    with ThreadPoolExecutor(max_workers=par) as ex:
+        futs = [ex.submit(_register_job, e, d, c) for e, d, c in jobs]
         for f in as_completed(futs):
             good, email, why = f.result()
             results.append((email, "OK" if good else why))
