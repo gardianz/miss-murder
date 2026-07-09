@@ -1,47 +1,45 @@
 #!/usr/bin/env python3
 """
-Watcher channel Telegram — auto-tangkap REGISTRATION ACCESS CODE yang di-share
-developer di channel/grup, lalu jalankan register otomatis (register_http.py).
+Watcher channel Telegram — auto-tangkap ACCESS CODE register yang di-share developer
+di channel/grup, lalu register akun otomatis (register_http.py). Satu baris = satu kode.
 
-Beda dgn supa (invite code per-akun): di Edel, developer broadcast SATU access
-code. Server /auth/register/start skarang wajib field `accessCode` — tanpa itu
-403 REGISTRATION_ACCESS_CODE_REQUIRED, salah → REGISTRATION_ACCESS_CODE_INVALID.
-Watcher ini nangkep kode itu begitu diposting → register akun sebanyak target.
+Server /auth/register/start skarang wajib field `accessCode`: tanpa itu 403
+REGISTRATION_ACCESS_CODE_REQUIRED, salah → REGISTRATION_ACCESS_CODE_INVALID.
+Developer broadcast DAFTAR kode (1 per baris) → watcher register 1 akun per kode.
 
-Pakai Telethon (MTProto, login AKUN kamu sendiri) — bisa baca channel/grup apapun
-yang kamu ikuti TANPA jadi admin & tanpa nambah bot. Login HP sekali (watch.session).
+Format kode yang dikenali (1 per baris):
+  edel::9feb933d-e00e-413c-9989-59cda0c71f33   (prefix::uuid — dikirim apa adanya;
+                                                kalau ditolak, coba lagi tanpa prefix)
+  9feb933d-e00e-413c-...                        (uuid telanjang)
+  VZR57MP7P8                                    (kode pendek [A-Z0-9], huruf+angka)
+Atau set EDEL_CODE_RE (regex, group 1 = kode) buat format lain.
 
-Alur:
-  1. Login akun Telegram (first run: nomor HP + OTP telegram).
-  2. Listen pesan baru di EDEL_TG_WATCH (push handler + poller getHistory).
-  3. Tiap pesan: regex ambil access code (default: token setelah label
-     "access code/kode/registration code:"; atau set EDEL_CODE_RE sendiri).
-  4. Kode baru → PROBE dulu (register/start email buangan, tak di-finish = tak
-     bikin akun) → kalau valid → register_http.register_until / register_batch.
-  5. Hasil dikirim ke bot alert (TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID) / Telethon 'me'.
+Pakai Telethon (MTProto, login AKUN kamu sendiri) — baca channel/grup apapun yang
+kamu ikuti TANPA jadi admin. Login HP sekali (watch.session), lalu headless.
 
 env (.env):
   EDEL_TG_API_ID    api_id  dari https://my.telegram.org  (wajib)
   EDEL_TG_API_HASH  api_hash dari https://my.telegram.org (wajib)
-  EDEL_TG_WATCH     channel/grup dipantau (wajib). @user, id, atau link.
+  EDEL_TG_WATCH     channel/grup dipantau (default: handlpay). @user, id, atau link.
   EDEL_TG_NOTIFY    tujuan notif kalau tanpa bot (default: me = Saved Messages).
-  EDEL_TG_ALLOW     (tak dipakai di watcher) — lihat notif via bot di bawah.
-  EDEL_WATCH_TARGET N → register SAMPAI total akun >= N (register_until). default 0.
-  EDEL_WATCH_BATCH  n → kalau TARGET 0: register n akun BARU tiap kode baru. default 5.
+  EDEL_CODE_USES    berapa akun di-register per kode (default 1; naikkan kalau 1 kode multi-pakai).
+  EDEL_PROBE        1 = cek kode dulu (register/start, tak finish) sebelum register.
+                    default 0 (kode single-use bisa "kepakai" oleh probe → matikan).
   REG_WORKERS       paralel register (default 4). REG_JITTER jeda antar worker.
-  EDEL_CODE_RE      regex custom akses-kode (group 1 = kode). Kosong = heuristik label.
+  EDEL_CODE_RE      regex custom akses-kode (group 1 = kode). Kosong = 3 pola bawaan.
   EDEL_TG_CATCHUP   scan N pesan terakhir saat start (default 0).
   EDEL_TG_POLL      detik antar poll getHistory (default 1.0; 0=off).
   EDEL_TG_POLL_LIMIT N pesan terakhir tiap poll (default 3).
-  TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID  → notif via bot (andal). Kosong = Telethon.
+  TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID  → notif via bot (andal). Kosong = Telethon 'me'.
 
 jalan:
   python3 edel_watch.py                    # daemon (login first-run kalau belum)
   python3 edel_watch.py --catchup 20       # proses 20 pesan terakhir dulu, lalu listen
-  python3 edel_watch.py --test "Access code: ABCD-1234"   # tes regex extract (offline)
-  python3 edel_watch.py --code ABCD-1234   # fire register manual sekali (tanpa telegram)
+  python3 edel_watch.py --test "edel::...\nVZR57MP7P8"   # tes regex extract (offline)
+  python3 edel_watch.py --code edel::xxxx  # register 1 kode manual (tanpa telegram)
 """
-import os, sys, re, json, asyncio, functools
+import os, sys, re, json, random, asyncio, functools
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASEDIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -58,7 +56,7 @@ def _load_dotenv(path):
 _load_dotenv(os.environ.get("EDEL_ENV") or os.path.join(BASEDIR, ".env"))
 
 import requests
-import register_http as RH  # register_batch / register_until / REG_ACCESS_CODE / BASE / ORIGIN
+import register_http as RH  # register_one / register_batch / _append_account / gen_local / ...
 
 try:
     from telethon import TelegramClient, events
@@ -67,10 +65,10 @@ except ImportError:
 
 API_ID     = os.environ.get("EDEL_TG_API_ID", "").strip()
 API_HASH   = os.environ.get("EDEL_TG_API_HASH", "").strip()
-WATCH      = os.environ.get("EDEL_TG_WATCH", "").strip()
+WATCH      = os.environ.get("EDEL_TG_WATCH", "handlpay").strip() or "handlpay"
 NOTIFY     = os.environ.get("EDEL_TG_NOTIFY", "me").strip() or "me"
-TARGET     = int(os.environ.get("EDEL_WATCH_TARGET", "0") or "0")
-BATCH      = int(os.environ.get("EDEL_WATCH_BATCH", "5") or "5")
+USES       = int(os.environ.get("EDEL_CODE_USES", "1") or "1")   # akun per kode
+PROBE      = os.environ.get("EDEL_PROBE", "").lower() in ("1", "true", "yes", "on")
 WORKERS    = int(os.environ.get("REG_WORKERS", "4") or "4")
 CATCHUP    = int(os.environ.get("EDEL_TG_CATCHUP", "0") or "0")
 POLL       = float(os.environ.get("EDEL_TG_POLL", "1.0") or "1.0")
@@ -82,17 +80,14 @@ BOT_CHAT   = (os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 SESSION   = os.path.join(BASEDIR, "watch.session")
 SEEN_FILE = os.path.join(BASEDIR, "watch_seen.json")
 
-# Access code Edel formatnya bebas (server cuma cek valid/invalid). Default: tangkap
-# token SETELAH label ("access code / registration code / kode akses ...:"). Kalau
-# format dev beda, set EDEL_CODE_RE (group 1 = kode).
-_CUSTOM_RE = os.environ.get("EDEL_CODE_RE", "").strip()
-RE_LABELLED = re.compile(
-    r"(?:access[\s_-]*code|reg(?:istration)?[\s_-]*code|kode[\s_-]*(?:akses|register|registrasi)?)"
-    r"\s*[:=]?\s*[`\"']?([A-Za-z0-9][A-Za-z0-9._-]{3,63})[`\"']?",
-    re.IGNORECASE)
-RE_CUSTOM = re.compile(_CUSTOM_RE) if _CUSTOM_RE else None
+_UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+RE_PREFIXED = re.compile(r"[a-zA-Z0-9]+::" + _UUID)     # edel::uuid (kirim apa adanya)
+RE_UUID     = re.compile(_UUID)                          # uuid telanjang
+RE_SHORT    = re.compile(r"^[A-Z0-9]{8,20}$")            # kode pendek 1 baris (huruf+angka)
+_CUSTOM_RE  = os.environ.get("EDEL_CODE_RE", "").strip()
+RE_CUSTOM   = re.compile(_CUSTOM_RE) if _CUSTOM_RE else None
 
-_seen = set()   # dedup access code sudah diproses
+_seen = set()   # dedup kode sudah diproses (persist watch_seen.json)
 
 
 def _load_seen():
@@ -113,75 +108,130 @@ def _save_seen():
 
 
 def extract_codes(text):
-    """Ambil access code dari teks. EDEL_CODE_RE (group 1) kalau di-set; else heuristik
-    label. Dedup, urut kemunculan."""
+    """Ambil semua access code dari teks (dedup, urut kemunculan).
+    EDEL_CODE_RE (group 1) kalau di-set; else 3 pola: prefix::uuid, uuid telanjang,
+    kode pendek [A-Z0-9]{8,20} yang jadi 1 baris utuh (huruf+angka, biar tak salah
+    tangkap kata BIASA seperti 'ANNOUNCEMENT')."""
     if not text:
         return []
     codes, seen = [], set()
-    rx = RE_CUSTOM or RE_LABELLED
-    for m in rx.finditer(text):
-        c = (m.group(1) if m.groups() else m.group(0)).strip()
-        if c and c.lower() not in ("required", "invalid") and c not in seen:
+    def add(c):
+        if c and c not in seen:
             seen.add(c); codes.append(c)
+    if RE_CUSTOM:
+        for m in RE_CUSTOM.finditer(text):
+            add((m.group(1) if m.groups() else m.group(0)).strip())
+        return codes
+    covered = set()   # uuid yang sudah ketangkap versi prefix → jangan dobel telanjang
+    for m in RE_PREFIXED.finditer(text):
+        add(m.group(0)); covered.add(m.group(0).split("::", 1)[1])
+    for m in RE_UUID.finditer(text):
+        if m.group(0) not in covered:
+            add(m.group(0))
+    # kode pendek: kumpulkan baris yang UTUH cuma token [A-Z0-9]{8,20}. Kalau >=2 → itu
+    # daftar kode, ambil semua (incl. yg tanpa digit spt ORMPJBKYZI). Kalau cuma 1 →
+    # wajib ada huruf+angka (anti false-positive kata tunggal spt 'ANNOUNCEMENT').
+    shorts = [line.strip().strip("`\"'") for line in text.splitlines()]
+    shorts = [s for s in shorts if RE_SHORT.match(s)]
+    if len(shorts) >= 2:
+        for s in shorts: add(s)
+    elif len(shorts) == 1:
+        s = shorts[0]
+        if any(c.isdigit() for c in s) and any(c.isalpha() for c in s):
+            add(s)
     return codes
 
 
 def probe_code(code):
-    """Cek kode valid TANPA bikin akun: register/start email buangan + accessCode, TAK
-    di-finish. Return (ok, why). Header browser wajib (edge WAF 404 kalau UA non-browser)."""
+    """Cek kode valid TANPA finish (tak bikin akun). Return (True/False/None, why).
+    None = tak yakin (error jaringan). Header browser wajib (edge WAF 404 utk UA non-browser)."""
     email = f"probe_{RH.secrets.token_hex(5)}@weling.web.id"
     try:
         r = requests.post(RH.BASE + "/auth/register/start",
             json={"email": email, "displayName": "probe", "accessCode": code},
             headers={"Content-Type": "application/json", "Accept": "application/json",
                      "User-Agent": "Mozilla/5.0", "Origin": RH.ORIGIN,
-                     "Referer": RH.ORIGIN + "/register"},
-            timeout=25)
+                     "Referer": RH.ORIGIN + "/register"}, timeout=25)
     except Exception as e:
-        return None, f"probe err: {e}"   # None = tak yakin, tetap coba register
+        return None, f"probe err: {e}"
     if r.status_code == 200:
         return True, "valid"
     try:
-        code_err = r.json().get("error", {}).get("code", "") or f"HTTP {r.status_code}"
+        why = r.json().get("error", {}).get("code", "") or f"HTTP {r.status_code}"
     except Exception:
-        code_err = f"HTTP {r.status_code}"
-    return False, code_err
+        why = f"HTTP {r.status_code}"
+    return False, why
 
 
-def _run_register_blocking(code):
-    """Blocking — dipanggil lewat executor. Set access code lalu register."""
-    RH.REG_ACCESS_CODE = code   # register_one baca global ini saat call
-    log = lambda m: print("[reg]", m)
-    if TARGET > 0:
-        made = RH.register_until(TARGET, workers=WORKERS, log=log)
-        return {"mode": "until", "target": TARGET, "made": made, "total": RH._count_accts()}
-    made = RH.register_batch(BATCH, workers=WORKERS, log=log)
-    return {"mode": "batch", "batch": BATCH, "made": made, "total": RH._count_accts()}
+def _register_with_code(existing, code):
+    """Register 1 akun dgn access code spesifik. `edel::uuid` ditolak → coba lagi uuid
+    telanjang. Return (ok, email, why). existing: set localpart terpakai (mutasi in-place)."""
+    local = RH.gen_local(existing); existing.add(local)
+    email = f"{local}@weling.web.id"
+    display = random.choice(RH.NAMES) + str(random.randint(100, 999))
+    proxies = RH.load_proxies()
+    proxy = random.choice(proxies) if proxies else None
+    RH.tempik_inbox(local)
+    tries = [code] + ([code.split("::", 1)[1]] if "::" in code else [])
+    why = "?"
+    for c in tries:
+        res = RH.register_one(email, display, proxy, access_code=c)
+        if res.get("ok"):
+            RH._append_account(res)
+            return True, email, "OK"
+        why = res.get("why", "?")
+        if "INVALID" not in why.upper():   # bukan soal kode → tak usah coba varian lain
+            break
+    return False, email, why
+
+
+def _register_codes_blocking(codes):
+    """Register PARALEL: tiap kode → USES akun (default 1). Return summary dict.
+    existing di-baca sekali di bawah _flock biar localpart tak tabrakan."""
+    with RH._flock():
+        existing = {a["email"].split("@")[0]
+                    for a in (json.load(open(RH.STATE)) if os.path.exists(RH.STATE) else [])}
+    jobs = [c for c in codes for _ in range(max(1, USES))]
+    results, ok = [], 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(_register_with_code, existing, c): c for c in jobs}
+        for f in as_completed(futs):
+            good, email, why = f.result()
+            results.append((email, "OK" if good else why))
+            if good: ok += 1
+    return {"ok": ok, "n": len(jobs), "results": results, "total": RH._count_accts()}
 
 
 async def process(client, codes, src="", force=False):
-    """Proses access code baru: dedup, probe, register di executor, notif."""
+    """Proses kode baru: dedup, (opsional probe), register paralel, notif hasil."""
     fresh = list(codes) if force else [c for c in codes if c not in _seen]
     if not fresh:
         return
     for c in fresh:
         _seen.add(c)
     _save_seen()
-    for code in fresh:
-        ok, why = probe_code(code)
-        if ok is False:
-            await notify(client, f"⛔ Kode <code>{code}</code> dari <b>{src}</b> ditolak: {why} — skip.")
-            continue
-        tag = "valid ✅" if ok else f"tak yakin ({why}) — tetap coba"
-        await notify(client, f"🔔 Access code baru dari <b>{src}</b>: <code>{code}</code> ({tag}) → register…")
-        try:
-            loop = asyncio.get_event_loop()
-            res = await loop.run_in_executor(None, functools.partial(_run_register_blocking, code))
-        except Exception as e:
-            await notify(client, f"❌ error register: {e}")
-            continue
-        await notify(client, f"🏁 Selesai (mode {res['mode']}): +{res['made']} akun baru. "
-                             f"Total akun: {res['total']}.")
+    if PROBE:
+        checked = []
+        for c in fresh:
+            ok, why = probe_code(c)
+            if ok is False:
+                await notify(client, f"⛔ Kode <code>{c}</code> ditolak: {why} — skip.")
+            else:
+                checked.append(c)
+        fresh = checked
+        if not fresh:
+            return
+    await notify(client, f"🔔 {len(fresh)} kode baru dari <b>{src}</b> → register "
+                         f"({USES} akun/kode)…\n" + "\n".join(fresh[:20]))
+    try:
+        loop = asyncio.get_event_loop()
+        res = await loop.run_in_executor(None, functools.partial(_register_codes_blocking, fresh))
+    except Exception as e:
+        await notify(client, f"❌ error register: {e}")
+        return
+    lines = [f"{'✅' if st == 'OK' else '❌'} {e}: {st}" for e, st in res["results"]]
+    await notify(client, f"🏁 Selesai: {res['ok']}/{res['n']} akun jadi. "
+                         f"Total akun: {res['total']}.\n" + ("\n".join(lines[:25]) or "(tak ada)"))
 
 
 async def poller(client, title):
@@ -245,19 +295,16 @@ async def catchup(client):
 async def amain():
     if not API_ID or not API_HASH:
         print("Set EDEL_TG_API_ID & EDEL_TG_API_HASH di .env (https://my.telegram.org)."); sys.exit(1)
-    if not WATCH:
-        print("Set EDEL_TG_WATCH (channel/grup yang dipantau)."); sys.exit(1)
     _load_seen()
     client = TelegramClient(SESSION, int(API_ID), API_HASH)
     await client.start()  # first run: nomor HP + OTP telegram (interaktif)
     me = await client.get_me()
     ent = await client.get_entity(WATCH)
     title = getattr(ent, "title", None) or getattr(ent, "username", WATCH)
-    mode = f"until {TARGET}" if TARGET > 0 else f"batch {BATCH}/kode"
-    print(f"login sbg {me.first_name} (id {me.id}). Pantau: {title}. Mode {mode}. "
+    print(f"login sbg {me.first_name} (id {me.id}). Pantau: {title}. {USES} akun/kode. "
           f"Notif → {'bot' if (BOT_TOKEN and BOT_CHAT) else NOTIFY}")
-    await notify(client, f"👀 Edel watcher aktif. Pantau <b>{title}</b> ({mode}). "
-                         f"Access code auto-register.")
+    await notify(client, f"👀 Edel watcher aktif. Pantau <b>{title}</b>. "
+                         f"Access code auto-register ({USES} akun/kode).")
 
     @client.on(events.NewMessage(chats=WATCH))
     async def _(event):
@@ -275,17 +322,18 @@ async def amain():
 
 
 def _cli_test(text):
-    codes = extract_codes(text)
+    codes = extract_codes(text.replace("\\n", "\n"))
     print("extracted:", codes or "(tak ada — set EDEL_CODE_RE atau cek format)")
 
 
 def _cli_code(code):
-    """Fire register manual sekali (tanpa telegram)."""
-    ok, why = probe_code(code)
-    print(f"probe: ok={ok} why={why}")
-    if ok is False:
-        print("kode ditolak, batal."); return
-    res = _run_register_blocking(code)
+    """Register 1 kode manual (tanpa telegram)."""
+    if PROBE:
+        ok, why = probe_code(code)
+        print(f"probe: ok={ok} why={why}")
+        if ok is False:
+            print("kode ditolak, batal."); return
+    res = _register_codes_blocking([code])
     print("hasil:", res)
 
 

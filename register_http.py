@@ -89,7 +89,7 @@ NO_PROXY = os.environ.get("NO_PROXY", "").lower() in ("1", "true", "yes", "on")
 REG_JITTER = float(os.environ.get("REG_JITTER", "2"))  # sebar tiap worker biar tak spam back-to-back
 REG_ACCESS_CODE = os.environ.get("REG_ACCESS_CODE", "").strip()  # wajib: server tolak register tanpa accessCode valid
 
-def register_one(email, display, proxy, tries=6):
+def register_one(email, display, proxy, tries=6, access_code=None):
     proxies = None if NO_PROXY else ({"http": proxy, "https": proxy} if proxy else None)
     s = requests.Session()
     s.headers.update({"Accept": "application/json", "Content-Type": "application/json",
@@ -103,8 +103,9 @@ def register_one(email, display, proxy, tries=6):
             time.sleep(2)
         return None
     # 1) start
+    code = access_code if access_code is not None else REG_ACCESS_CODE  # param override global
     start_body = {"email": email, "displayName": display}
-    if REG_ACCESS_CODE: start_body["accessCode"] = REG_ACCESS_CODE
+    if code: start_body["accessCode"] = code
     r = post("/auth/register/start", start_body)
     if not r or r.status_code != 200:
         why = f"start {r.status_code if r else 'ERR'}"
@@ -164,8 +165,9 @@ def _append_account(acct):
         accts.append(acct)
         tmp = STATE + ".tmp"; json.dump(accts, open(tmp, "w"), indent=2); os.replace(tmp, STATE)
 
-def register_batch(n, workers=4, log=print):
-    """Register n akun PARALEL full-HTTP. Return jumlah sukses."""
+def register_batch(n, workers=4, log=print, access_code=None):
+    """Register n akun PARALEL full-HTTP. Return jumlah sukses.
+    access_code: override REG_ACCESS_CODE global (mis. dari watcher, per-kode)."""
     proxies = load_proxies()
     with _flock():
         existing = {a["email"].split("@")[0] for a in (json.load(open(STATE)) if os.path.exists(STATE) else [])}
@@ -180,7 +182,7 @@ def register_batch(n, workers=4, log=print):
         email, display, local, proxy = job
         if REG_JITTER: time.sleep(random.uniform(0, REG_JITTER))  # jeda acak, hindari burst serempak
         tempik_inbox(local)
-        return register_one(email, display, proxy)
+        return register_one(email, display, proxy, access_code=access_code)
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for fut in as_completed([ex.submit(one, j) for j in jobs]):
             res = fut.result()

@@ -8,7 +8,7 @@ usage:
   python3 edel_cli.py            # menu interaktif
   python3 edel_cli.py dash       # langsung dashboard live
 """
-import sys, os, time, json, threading, datetime as dt, termios, tty, select
+import sys, os, time, json, threading, asyncio, datetime as dt, termios, tty, select
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import listing_bot as LB
@@ -377,6 +377,31 @@ def act_import_cookie(accts):
         console.print(f"[bold green]selesai: +{total_new} baru · {total_upd} update · total fleet {len(accts)}[/]")
     questionary.text("enter untuk lanjut").ask()
 
+def act_watch(accts):
+    """Watcher Telegram — pantau channel, auto-register tiap access code baru muncul."""
+    import edel_watch as EW
+    if not (EW.API_ID and EW.API_HASH):
+        console.print("[red]EDEL_TG_API_ID / EDEL_TG_API_HASH belum di-set di .env[/] "
+                      "[dim](ambil di https://my.telegram.org)[/]")
+        questionary.text("enter untuk lanjut").ask(); return
+    ch = questionary.text("channel/grup dipantau:", default=EW.WATCH).ask()
+    if not ch: return
+    EW.WATCH = ch.strip()
+    EW.USES = int(questionary.text("akun di-register per kode:", default=str(EW.USES)).ask() or str(EW.USES))
+    catch = int(questionary.text("scan N pesan terakhir dulu (catchup, 0=tidak):", default="0").ask() or "0")
+    EW.CATCHUP = catch
+    notif = "bot alert" if (EW.BOT_TOKEN and EW.BOT_CHAT) else f"Telethon '{EW.NOTIFY}'"
+    console.print(f"[orange1]Watcher: pantau {EW.WATCH}, {EW.USES} akun/kode, notif {notif}. "
+                  f"Ctrl-C untuk berhenti.[/]\n[dim]First-run minta nomor HP + OTP Telegram (sekali).[/]")
+    try:
+        asyncio.run(EW.amain())
+    except KeyboardInterrupt:
+        console.print("[green]watcher berhenti.[/]")
+    except Exception as e:
+        console.print(f"[red]watcher error: {str(e)[:120]}[/]")
+    console.print(f"[dim]total akun sekarang: {len(LB.load_accts())}[/]")
+    questionary.text("enter untuk lanjut").ask()
+
 def act_auto(accts):
     workers = int(questionary.text("paralel workers:", default="16").ask() or "16")
     fast = int(questionary.text("interval CEPAT (detik, saat ada yg menunggu settlement):", default="45").ask() or "45")
@@ -541,7 +566,8 @@ def menu():
         pxlabel = "🌐 Proxy: OFF (koneksi langsung)" if LB.NO_PROXY else "🌐 Proxy: ON (pakai proxy akun)"
         choice = questionary.select(
             "EDEL DESK TERMINAL — pilih:",
-            choices=["📊 Dashboard live", "➕ Register Akun (HTTP)", "🍪 Import Akun (cookie ekstensi)",
+            choices=["📊 Dashboard live", "➕ Register Akun (HTTP)", "👀 Watcher Kode Telegram",
+                     "🍪 Import Akun (cookie ekstensi)",
                      "▶  Jalankan Listing Calls (sekali)",
                      "🔁 Auto Listing (tiap window)", "💸 Kirim EDELx (bulk)", "🔑 Refresh Sesi",
                      "📈 Riwayat Listing Call", "📋 Status Fleet", "🏦 Party IDs (deposit)", "⏳ Pantau Settlement",
@@ -555,6 +581,7 @@ def menu():
         accts = LB.load_accts(); LB._ACCTS = accts  # reload state fresh
         if choice.startswith("📊"): dashboard(accts)
         elif choice.startswith("➕"): act_register(accts)
+        elif choice.startswith("👀"): act_watch(accts)
         elif choice.startswith("🍪"): act_import_cookie(accts)
         elif choice.startswith("▶"): act_run(accts)
         elif choice.startswith("🔁"): act_auto(accts)
