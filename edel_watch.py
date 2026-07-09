@@ -182,10 +182,11 @@ def _register_job(email, display, code):
     telanjang. Return (ok, email, why).
 
     proxy=None SELALU: redeem FCFS → koneksi langsung paling cepat (proxy nambah hop/latency).
+    tempik_inbox DITUNDA sampai MENANG: register/start konsumsi kode & ini balapan — jangan
+    buang 2 HTTP call bikin inbox di jalur kritis; inbox cukup dibikin buat pemenang.
     Simpan akun HANYA kalau data passkey LENGKAP (privateKey wajib — tanpa itu akun tak bisa
     login/refresh selamanya). Kalau privateKey hilang, akun tetap didump ke accounts_incomplete.json
     agar tak lenyap, tapi ditandai gagal biar kelihatan."""
-    RH.tempik_inbox(email.split("@")[0])
     tries = [code] + ([code.split("::", 1)[1]] if "::" in code else [])
     why = "?"
     for c in tries:
@@ -199,7 +200,8 @@ def _register_job(email, display, code):
                         f.write(json.dumps(res) + "\n")
                 except OSError: pass
                 return False, email, "OK_BUT_NO_PRIVATEKEY(cek accounts_incomplete.json)"
-            RH._append_account(res)   # atomik (_flock) → accounts.json lengkap: privateKey+publicKey+credId
+            RH._append_account(res)       # atomik (_flock) → accounts.json lengkap: privateKey+publicKey+credId
+            RH.tempik_inbox(email.split("@")[0])  # menang → baru bikin inbox (buat terima mail nanti)
             return True, email, "OK"
         why = res.get("why", "?")
         if "INVALID" not in why.upper():   # bukan soal kode → tak usah coba varian lain

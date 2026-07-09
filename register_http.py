@@ -107,8 +107,8 @@ def register_one(email, display, proxy, tries=6, access_code=None):
     start_body = {"email": email, "displayName": display}
     if code: start_body["accessCode"] = code
     r = post("/auth/register/start", start_body)
-    if not r or r.status_code != 200:
-        why = f"start {r.status_code if r else 'ERR'}"
+    if r is None or r.status_code != 200:   # NB: bool(Response) False utk 4xx → cek 'is None' eksplisit
+        why = f"start {r.status_code if r is not None else 'ERR'}"
         if r is not None:
             try:
                 code = r.json().get("error", {}).get("code", "")
