@@ -17,6 +17,11 @@ proxies.txt
 .env
 .env.local
 
+# ═══ telethon watcher (session = login akun Telegram, JANGAN commit) ═══
+*.session
+*.session-journal
+watch_seen.json
+
 # ═══ log & runtime ═══
 *.log
 register_*.log
