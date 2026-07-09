@@ -54,8 +54,11 @@ def _load_dotenv(path):
             k, v = line.split("=", 1)
             v = v.strip()
             if v[:1] not in ("'", '"'):          # value tak dikutip → potong komentar inline
-                for sep in (" #", "\t#"):
-                    if sep in v: v = v.split(sep, 1)[0].rstrip()
+                if v.startswith("#"):
+                    v = ""                        # value cuma komentar (KEY=  # ket) → kosong
+                else:
+                    for sep in (" #", "\t#"):
+                        if sep in v: v = v.split(sep, 1)[0].rstrip()
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     except Exception:
         pass
@@ -92,6 +95,7 @@ _UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F
 RE_PREFIXED = re.compile(r"[a-zA-Z0-9]+::" + _UUID)     # edel::uuid (kirim apa adanya)
 RE_UUID     = re.compile(_UUID)                          # uuid telanjang
 RE_SHORT    = re.compile(r"^[A-Z0-9]{8,20}$")            # kode pendek 1 baris (huruf+angka)
+RE_GROUPED  = re.compile(r"\b[A-Z0-9]{4}(?:-[A-Z0-9]{4}){3,5}\b")  # E2WR-DLW4-PTZK-JJ3K-CCSD (4-6 grup)
 _CUSTOM_RE  = os.environ.get("EDEL_CODE_RE", "").strip()
 RE_CUSTOM   = re.compile(_CUSTOM_RE) if _CUSTOM_RE else None
 
@@ -117,9 +121,8 @@ def _save_seen():
 
 def extract_codes(text):
     """Ambil semua access code dari teks (dedup, urut kemunculan).
-    EDEL_CODE_RE (group 1) kalau di-set; else 3 pola: prefix::uuid, uuid telanjang,
-    kode pendek [A-Z0-9]{8,20} yang jadi 1 baris utuh (huruf+angka, biar tak salah
-    tangkap kata BIASA seperti 'ANNOUNCEMENT')."""
+    EDEL_CODE_RE (group 1) kalau di-set; else pola: grup XXXX-XXXX-… (format Edel resmi),
+    prefix::uuid, uuid telanjang, kode pendek [A-Z0-9]{8,20} 1 baris utuh."""
     if not text:
         return []
     codes, seen = [], set()
@@ -130,6 +133,9 @@ def extract_codes(text):
         for m in RE_CUSTOM.finditer(text):
             add((m.group(1) if m.groups() else m.group(0)).strip())
         return codes
+    # 0) format resmi Edel: 4-6 grup [A-Z0-9]{4} dipisah '-' (mis. E2WR-DLW4-PTZK-JJ3K-CCSD)
+    for m in RE_GROUPED.finditer(text):
+        add(m.group(0))
     covered = set()   # uuid yang sudah ketangkap versi prefix → jangan dobel telanjang
     for m in RE_PREFIXED.finditer(text):
         add(m.group(0)); covered.add(m.group(0).split("::", 1)[1])

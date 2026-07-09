@@ -31,8 +31,11 @@ def _load_dotenv(path):
             k, v = line.split("=", 1)
             v = v.strip()
             if v[:1] not in ("'", '"'):          # value tak dikutip → potong komentar inline
-                for sep in (" #", "\t#"):
-                    if sep in v: v = v.split(sep, 1)[0].rstrip()
+                if v.startswith("#"):
+                    v = ""                        # value cuma komentar (KEY=  # ket) → kosong
+                else:
+                    for sep in (" #", "\t#"):
+                        if sep in v: v = v.split(sep, 1)[0].rstrip()
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     except Exception:
         pass
