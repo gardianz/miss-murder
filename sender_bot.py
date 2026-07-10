@@ -47,10 +47,14 @@ def get_preapprovals(acct):
     return pa.get("preapprovals", []) if isinstance(pa, dict) else []
 
 def enable_receiving(acct, instrument, log=print):
-    """Aktifkan RECEIVING satu token. POST /transfers/preapprovals {instrumentId}. 200/201 = ok."""
+    """Aktifkan RECEIVING satu token. POST /transfers/preapprovals {instrumentId}.
+    200/201/202 = ok (202 = async on-chain accepted, mirip transfer). Gagal → log status ASLI
+    (bukan cuma 'ERR'): 'ERR <detail>' = api mentok API_DEADLINE (biasanya contention on-chain/429)."""
     st, r = LB.api(acct, "POST", "/transfers/preapprovals", {"instrumentId": instrument})
-    ok = st in (200, 201)
-    if not ok: log(f"  [{acct['email']}] enable receiving {instrument}: {st} {_err(r)}")
+    ok = st in (200, 201, 202)
+    if not ok:
+        detail = _err(r) or (r if isinstance(r, str) else "")
+        log(f"  [{acct['email']}] enable receiving {instrument}: {st} {detail}".rstrip())
     return ok
 
 def ensure_recv_preapproval(acct, log=print, instrument=INSTRUMENT):
@@ -73,23 +77,44 @@ def ensure_receiving_all(acct, log=print):
             nafter += 1
     return nafter, total
 
-def enable_all_preapprovals(accts, emails=None, workers=16, log=print):
+PREAPPROVE_WORKERS = int(os.environ.get("PREAPPROVE_WORKERS", "8"))  # POST preapproval = tulis ledger; jgn terlalu banyak (contention)
+PREAPPROVE_ROUNDS  = int(os.environ.get("PREAPPROVE_ROUNDS", "4"))   # ronde re-sweep akun yg belum penuh
+PREAPPROVE_GAP     = float(os.environ.get("PREAPPROVE_GAP", "6"))    # jeda antar ronde (biar contention on-chain reda)
+
+def enable_all_preapprovals(accts, emails=None, workers=PREAPPROVE_WORKERS,
+                            rounds=PREAPPROVE_ROUNDS, gap=PREAPPROVE_GAP, log=print):
     """Bulk: aktifkan receiving SEMUA token untuk banyak akun paralel (butuh sesi tiap akun).
-    emails=None → semua target. Return list (email, n_aktif, n_total)."""
+    RE-SWEEP: akun yang belum penuh di-retry sampai `rounds` ronde (jeda `gap` detik antar ronde) —
+    kegagalan CC biasanya transient (contention on-chain / 429 saat login+POST massal serempak).
+    emails=None → semua target. Return list (email, n_aktif, n_total) hasil TERBAIK per akun."""
     ts = LB.targets(accts)
     if emails is not None:
         want = set(emails); ts = [a for a in ts if a["email"] in want]
-    def one(a):
+    by_email = {a["email"]: a for a in ts}
+    best = {}                     # email -> (n_aktif, n_total) terbaik sejauh ini
+    pending = [a["email"] for a in ts]
+    def one(em):
+        a = by_email[em]
         if not LB.ensure_session(a, accts):
-            log(f"  [{a['email']}] sesi mati — skip"); return (a["email"], 0, 0)
+            log(f"  [{em}] sesi mati / login gagal — retry ronde berikut"); return (em, 0, 0)
         nn, tot = ensure_receiving_all(a, log=log)
-        log(f"  [{a['email']}] receiving {nn}/{tot} token aktif")
-        return (a["email"], nn, tot)
-    out = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for fut in as_completed([ex.submit(one, a) for a in ts]):
-            out.append(fut.result())
-    return out
+        log(f"  [{em}] receiving {nn}/{tot} token aktif")
+        return (em, nn, tot)
+    for rnd in range(1, rounds + 1):
+        if not pending: break
+        if rnd > 1:
+            log(f"  ↻ ronde {rnd}/{rounds}: retry {len(pending)} akun belum penuh (jeda {gap:.0f}s)…")
+            time.sleep(gap)
+        nxt = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for fut in as_completed([ex.submit(one, em) for em in pending]):
+                em, nn, tot = fut.result()
+                prev = best.get(em, (0, 0))
+                if (nn, tot) > prev or em not in best: best[em] = (nn, tot)
+                full = tot and nn == tot
+                if not full: nxt.append(em)
+        pending = nxt
+    return [(em, nn, tot) for em, (nn, tot) in best.items()]
 
 def transfer(sender, to_party, amount, idem, ref=None, log=print):
     """Satu transfer. Return status: ok | recv_needed | insufficient | send_preapproval | fail."""
