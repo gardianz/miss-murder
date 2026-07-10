@@ -30,7 +30,7 @@ env (.env):
   EDEL_CODE_RE      regex custom akses-kode (group 1 = kode). Kosong = 3 pola bawaan.
   EDEL_TG_CATCHUP   scan N pesan terakhir saat start (default 0).
   EDEL_TG_POLL      detik antar poll getHistory (default 1.0; 0=off).
-  EDEL_TG_POLL_LIMIT N pesan terakhir tiap poll (default 3).
+  EDEL_TG_POLL_LIMIT N pesan terakhir tiap poll (default 10; chat rame perlu lebih besar).
   TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID  → notif via bot (andal). Kosong = Telethon 'me'.
 
 jalan:
@@ -84,7 +84,7 @@ MAXPAR     = int(os.environ.get("EDEL_WATCH_MAXPAR", "24") or "24")  # cap threa
 PREWARM    = int(os.environ.get("EDEL_PREWARM", "16") or "16")   # identitas pre-gen sebelum kode drop
 CATCHUP    = int(os.environ.get("EDEL_TG_CATCHUP", "0") or "0")
 POLL       = float(os.environ.get("EDEL_TG_POLL", "1.0") or "1.0")
-POLL_LIMIT = int(os.environ.get("EDEL_TG_POLL_LIMIT", "3") or "3")
+POLL_LIMIT = int(os.environ.get("EDEL_TG_POLL_LIMIT", "10") or "10")  # chat rame: >3 pesan/0.5s bisa geser kode keluar window
 BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 BOT_CHAT   = (os.environ.get("TELEGRAM_CHAT_ID", "").strip()
               or (NOTIFY if NOTIFY.lstrip("-").isdigit() else ""))
@@ -289,14 +289,18 @@ async def process(client, codes, src="", force=False):
                                        f"({USES} akun/kode)…\n" + "\n".join(fresh[:20])))
     _save_seen()
     loop.run_in_executor(None, _prewarm_pool, PREWARM)   # isi ulang pool buat drop berikut
-    try:
-        res = await fut
-    except Exception as e:
-        await notify(client, f"❌ error register: {e}")
-        return
-    lines = [f"{'✅' if st == 'OK' else '❌'} {e}: {st}" for e, st in res["results"]]
-    await notify(client, f"🏁 Selesai: {res['ok']}/{res['n']} akun jadi. "
-                         f"Total akun: {res['total']}.\n" + ("\n".join(lines[:25]) or "(tak ada)"))
+    # JANGAN await hasil register di sini — poller & push handler manggil process() lewat 'await',
+    # jadi kalau kita nunggu batch (bisa puluhan detik krn finish retry) loop poller MACET dan
+    # drop berikutnya kelewat. Selesaikan + notif di task terpisah, process() balik seketika.
+    async def _finish():
+        try:
+            res = await fut
+        except Exception as e:
+            await notify(client, f"❌ error register: {e}"); return
+        lines = [f"{'✅' if st == 'OK' else '❌'} {e}: {st}" for e, st in res["results"]]
+        await notify(client, f"🏁 Selesai: {res['ok']}/{res['n']} akun jadi. "
+                             f"Total akun: {res['total']}.\n" + ("\n".join(lines[:25]) or "(tak ada)"))
+    asyncio.create_task(_finish())
 
 
 async def poller(client, chans):
