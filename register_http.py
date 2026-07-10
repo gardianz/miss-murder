@@ -126,12 +126,15 @@ def register_one(email, display, proxy, tries=6, access_code=None):
         s = requests.Session()
         s.headers.update(_REG_HDR)
         proxies = {"http": proxy, "https": proxy}
+    last_err = {"v": ""}                       # alasan gagal terakhir (buat diagnosa finish ERR)
     def post(path, body):
         for _ in range(tries):
             try:
                 r = s.post(BASE + path, json=body, proxies=proxies, timeout=25)
                 if r.status_code < 500: return r
-            except Exception: pass
+                last_err["v"] = f"HTTP{r.status_code} {r.text[:80]}"
+            except Exception as e:
+                last_err["v"] = f"{type(e).__name__}: {str(e)[:80]}"
             time.sleep(2)
         return None
     # 1) start
@@ -146,6 +149,8 @@ def register_one(email, display, proxy, tries=6, access_code=None):
                 code = r.json().get("error", {}).get("code", "")
                 if code: why += f" {code}"
             except Exception: pass
+        else:
+            why += f" {last_err['v']}"
         return {"ok": False, "email": email, "why": why}
     opts = r.json()["options"]
     challenge = opts["challenge"]; rp_id = opts["rp"]["id"]
@@ -168,7 +173,8 @@ def register_one(email, display, proxy, tries=6, access_code=None):
     # 3) finish
     r = post("/auth/register/finish", body)
     if not r or r.status_code not in (200, 201):
-        return {"ok": False, "email": email, "why": f"finish {r.status_code if r else 'ERR'} {r.text[:100] if r else ''}"}
+        why = f"finish {r.status_code if r else 'ERR'} {r.text[:100] if r else last_err['v']}"
+        return {"ok": False, "email": email, "why": why}
     prof = r.json().get("profile", {})
     return {
         "email": email, "displayName": display, "ok": True,
