@@ -211,6 +211,7 @@ def render(accts, sel=0):
     atab.add_column("SES", width=4, justify="center")
     atab.add_column("VF", width=3, justify="center")
     atab.add_column("EDELx av/lock", justify="right", width=15)
+    atab.add_column("CC🎁", style=C_OK, justify="right", width=8)
     atab.add_column("SUB", width=4, justify="right")
     atab.add_column("FASE", width=13)
     for i in range(off, min(off + ROWS, n)):
@@ -220,6 +221,8 @@ def render(accts, sel=0):
         vf = "[green]✓[/]" if a.get("credVerified") is True else "[yellow]?[/]"
         e = live.get("edelx")
         edx = f"{e['available']:.1f}/{(e['staked']+e['locked']):.1f}" if e else "[grey37]—[/]"  # avail / (staked+locked terkunci)
+        cc = live.get("cc")
+        ccx = f"{cc['total']:.2f}" if cc else "[grey37]—[/]"
         ph = live.get("phase", "idle")
         flabel, fc = PHASE_SHORT.get(ph, ("—", C_DIM))
         sub = (a.get("stats") or {}).get("submitted", 0)
@@ -228,7 +231,7 @@ def render(accts, sel=0):
         mark = "▶" if i == sel else " "
         emname = em.split("@")[0][:18]
         if LB.is_manual(a): emname = f"{emname} [cyan]🍪[/]"  # tanda akun IMPORT COOKIE
-        atab.add_row(mark, emname, party, ses, vf, edx, subc, f"[{fc}]{flabel}[/]", style=rstyle)
+        atab.add_row(mark, emname, party, ses, vf, edx, ccx, subc, f"[{fc}]{flabel}[/]", style=rstyle)
     atab.caption = f"↑/↓ pilih · q keluar    [{sel+1}/{n}]"
 
     # panel bawah: DETAIL + LOG akun terpilih
@@ -571,9 +574,10 @@ def act_send(accts):
     questionary.text("enter untuk lanjut").ask()
 
 def act_preapprove(accts):
-    """Aktifkan pre-approval (send SEMUA token + receiving) untuk banyak akun sekaligus."""
+    """Aktifkan Receiving Settings (pre-approval receiving SEMUA token: EDELx, CC) untuk banyak akun.
+    Penting: CC default OFF → reward CC tak landing sampai ini di-enable."""
     ts = LB.targets(accts)
-    scope = questionary.select("Aktifkan pre-approval untuk:", choices=[
+    scope = questionary.select("Aktifkan receiving SEMUA token (EDELx+CC) untuk:", choices=[
         "Semua akun (target)", "Hanya akun sesi valid", "Pilih akun (checkbox)", "Batal"]).ask()
     if not scope or scope == "Batal": return
     if scope.startswith("Hanya akun sesi"):
@@ -585,14 +589,11 @@ def act_preapprove(accts):
         pick = [ts[labels.index(c)]["email"] for c in chosen]
     else:
         pick = [a["email"] for a in ts]
-    recv = questionary.confirm("Sertakan receiving pre-approval juga? (biar bisa TERIMA transfer)", default=True).ask()
-    console.print(f"[orange1]pre-approval SEMUA token untuk {len(pick)} akun (send{'+recv' if recv else ''})…[/]")
-    res = SB.enable_all_preapprovals(accts, emails=pick, recv=bool(recv),
+    console.print(f"[orange1]enable receiving SEMUA token untuk {len(pick)} akun…[/]")
+    res = SB.enable_all_preapprovals(accts, emails=pick,
                                      log=lambda m: (logline(m), console.print(f"[dim]{m}[/]")))
-    ok = sum(1 for _, oks, ns, _ in res if ns and oks == ns)
-    rok = sum(1 for *_, r in res if r)
-    console.print(f"[bold green]selesai: send-preapproval penuh {ok}/{len(res)} akun"
-                  + (f" · receiving {rok}/{len(res)}" if recv else "") + "[/]")
+    full = sum(1 for _, nn, tot in res if tot and nn == tot)
+    console.print(f"[bold green]selesai: receiving penuh {full}/{len(res)} akun[/]")
     questionary.text("enter untuk lanjut").ask()
 
 def act_history(accts):

@@ -34,47 +34,57 @@ def ensure_send_preapproval(acct, log=print):
     log(f"  [{acct['email']}] enable sending preapproval: {'ok' if ok else st}")
     return ok
 
-def ensure_recv_preapproval(acct, log=print):
-    """Aktifkan 'EDELx receiving' di sisi penerima (butuh sesi penerima)."""
-    if not LB.ensure_session(acct, LB._ACCTS or [acct]): return False
-    st, r = LB.api(acct, "POST", "/transfers/preapproval", {})
-    return st in (200, 201, 409)  # 409 = mungkin sudah enabled
+# ── Receiving Settings (wallet page) = /transfers/preapprovals (plural, per-token) ──
+# Endpoint singular /transfers/preapproval SUDAH MATI (404 ROUTE_NOT_FOUND). Semua receiving
+# preapproval sekarang lewat endpoint plural: GET daftar {instrumentId, enabled}, POST {instrumentId}
+# untuk enable. instrumentId di sini pakai "CC" (bukan "Amulet" spt di /portfolio). CC default OFF →
+# reward CC tak landing sampai receiving CC di-enable.
+RECV_INSTRUMENTS = ("EDELx", "CC")  # fallback kalau daftar preapproval kosong
 
-def portfolio_instruments(acct):
-    """Semua instrumentId di portfolio akun (EDELx, Amulet/CC, dll)."""
-    st, pf = LB.api(acct, "GET", "/portfolio")
-    if not isinstance(pf, dict): return []
-    return [b["instrumentId"] for b in pf.get("balances", []) if b.get("instrumentId")]
-
-def ensure_send_preapproval_all(acct, instruments=None, log=print):
-    """Enable SENDING preapproval untuk SEMUA instrument (default: semua yg ada di portfolio).
-    Return (jumlah_enabled, jumlah_target)."""
+def get_preapprovals(acct):
+    """Daftar receiving preapproval per-token: [{instrumentId, enabled}] (= Receiving Settings wallet)."""
     st, pa = LB.api(acct, "GET", "/transfers/preapprovals")
-    have = {p.get("instrumentId") for p in (pa.get("preapprovals", []) if isinstance(pa, dict) else [])
-            if p.get("enabled")}
-    if instruments is None:
-        instruments = portfolio_instruments(acct) or [INSTRUMENT]
-    ok = 0
-    for inst in instruments:
-        if inst in have: ok += 1; continue
-        st, r = LB.api(acct, "POST", "/transfers/preapprovals", {"instrumentId": inst})
-        if st in (200, 201): ok += 1
-        else: log(f"  [{acct['email']}] send-preapproval {inst}: {st} {_err(r)}")
-    return ok, len(instruments)
+    return pa.get("preapprovals", []) if isinstance(pa, dict) else []
 
-def enable_all_preapprovals(accts, emails=None, recv=True, workers=16, log=print):
-    """Bulk: aktifkan send-preapproval SEMUA token + (opsi) receiving, untuk banyak akun paralel.
-    emails=None → semua target. Return list (email, ok_send, n_send, recv_ok)."""
+def enable_receiving(acct, instrument, log=print):
+    """Aktifkan RECEIVING satu token. POST /transfers/preapprovals {instrumentId}. 200/201 = ok."""
+    st, r = LB.api(acct, "POST", "/transfers/preapprovals", {"instrumentId": instrument})
+    ok = st in (200, 201)
+    if not ok: log(f"  [{acct['email']}] enable receiving {instrument}: {st} {_err(r)}")
+    return ok
+
+def ensure_recv_preapproval(acct, log=print, instrument=INSTRUMENT):
+    """Pastikan receiving 1 token (default EDELx) aktif di penerima (butuh sesi penerima)."""
+    if not LB.ensure_session(acct, LB._ACCTS or [acct]): return False
+    pas = get_preapprovals(acct)
+    e = next((p for p in pas if p.get("instrumentId") == instrument), None)
+    if e and e.get("enabled"): return True
+    return enable_receiving(acct, instrument, log=log)
+
+def ensure_receiving_all(acct, log=print):
+    """Aktifkan receiving SEMUA token yang belum enabled (EDELx, CC, dst). Return (n_aktif, n_total).
+    CC default OFF → tanpa ini reward CC tak masuk."""
+    pas = get_preapprovals(acct)
+    if not pas:  # akun baru mungkin belum ada entry → paksa set default
+        pas = [{"instrumentId": i, "enabled": False} for i in RECV_INSTRUMENTS]
+    total = len(pas); nafter = 0
+    for p in pas:
+        if p.get("enabled") or enable_receiving(acct, p.get("instrumentId"), log=log):
+            nafter += 1
+    return nafter, total
+
+def enable_all_preapprovals(accts, emails=None, workers=16, log=print):
+    """Bulk: aktifkan receiving SEMUA token untuk banyak akun paralel (butuh sesi tiap akun).
+    emails=None → semua target. Return list (email, n_aktif, n_total)."""
     ts = LB.targets(accts)
     if emails is not None:
         want = set(emails); ts = [a for a in ts if a["email"] in want]
     def one(a):
         if not LB.ensure_session(a, accts):
-            log(f"  [{a['email']}] sesi mati — skip"); return (a["email"], 0, 0, False)
-        oks, ns = ensure_send_preapproval_all(a, log=log)
-        rok = ensure_recv_preapproval(a, log=log) if recv else None
-        log(f"  [{a['email']}] send {oks}/{ns}" + (f" · recv {'ok' if rok else 'x'}" if recv else ""))
-        return (a["email"], oks, ns, rok)
+            log(f"  [{a['email']}] sesi mati — skip"); return (a["email"], 0, 0)
+        nn, tot = ensure_receiving_all(a, log=log)
+        log(f"  [{a['email']}] receiving {nn}/{tot} token aktif")
+        return (a["email"], nn, tot)
     out = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for fut in as_completed([ex.submit(one, a) for a in ts]):
