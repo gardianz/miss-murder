@@ -65,7 +65,9 @@ def _load_dotenv(path):
 _load_dotenv(os.environ.get("EDEL_ENV") or os.path.join(BASEDIR, ".env"))
 
 import requests
-import register_http as RH  # register_one / register_batch / _append_account / gen_local / ...
+import register_http as RH  # register_one / register_batch / _append_account
+import listing_bot as LB     # ensure_session / api (login akun baru buat enable receiving)
+import sender_bot as SB      # ensure_receiving_all (enable CC + EDELx receiving) / gen_local / ...
 
 try:
     from telethon import TelegramClient, events
@@ -205,6 +207,20 @@ def probe_code(code):
     return False, why
 
 
+AUTO_RECV = os.environ.get("EDEL_AUTO_RECV_CC", "1").lower() in ("1", "true", "yes", "on")
+
+def _enable_cc_receiving(acct):
+    """Best-effort: login akun baru + enable receiving SEMUA token (EDELx + CC) supaya reward CC
+    bisa LANDING (CC receiving default OFF). Dipanggil SETELAH menang (off hot-path FCFS). Gagal =
+    diamkan, jangan gagalkan register. Sesi yg didapat ikut tersimpan di acct sebelum _append_account."""
+    if not AUTO_RECV:
+        return
+    try:
+        if LB.ensure_session(acct, [acct]):
+            SB.ensure_receiving_all(acct, log=lambda m: None)
+    except Exception:
+        pass
+
 def _register_job(email, display, code):
     """Register 1 akun (identitas sudah dipesan). `edel::uuid` ditolak → coba lagi uuid
     telanjang. Return (ok, email, why).
@@ -228,7 +244,8 @@ def _register_job(email, display, code):
                         f.write(json.dumps(res) + "\n")
                 except OSError: pass
                 return False, email, "OK_BUT_NO_PRIVATEKEY(cek accounts_incomplete.json)"
-            RH._append_account(res)       # atomik (_flock) → accounts.json lengkap: privateKey+publicKey+credId
+            _enable_cc_receiving(res)     # login + enable CC/EDELx receiving (reward CC bisa landing); best-effort
+            RH._append_account(res)       # atomik (_flock) → accounts.json lengkap: privateKey+publicKey+credId+session
             RH.tempik_inbox(email.split("@")[0])  # menang → baru bikin inbox (buat terima mail nanti)
             return True, email, "OK"
         why = res.get("why", "?")
