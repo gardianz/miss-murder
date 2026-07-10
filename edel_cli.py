@@ -96,12 +96,15 @@ def refresh_fleet(accts, workers=10, only_session=True):
     if only_session:
         ts = [a for a in ts if LB.session_valid(a)]
     def one(a):
-        d = {"edelx": None, "round": None, "phase": "idle"}
+        d = {"edelx": None, "cc": None, "round": None, "phase": "idle"}
         b = None
         st, pf = LB.api(a, "GET", "/portfolio")
         if isinstance(pf, dict):
-            b = next((x for x in pf.get("balances", []) if x["instrumentId"] == "EDELx"), None)
+            bals = pf.get("balances", [])
+            b = next((x for x in bals if x["instrumentId"] == "EDELx"), None)
             if b: d["edelx"] = {k: LB.units(b[k]) for k in ("available", "locked", "staked", "total")}
+            cc = next((x for x in bals if x["instrumentId"] == "Amulet"), None)  # Amulet = Canton Coin (CC) = token reward
+            if cc: d["cc"] = {k: LB.units(cc[k]) for k in ("available", "locked", "staked", "total")}
         st, lr = LB.api(a, "GET", "/listing-round")
         if isinstance(lr, dict):
             rnd = lr.get("round"); d["round"] = rnd.get("status") if rnd else "—"
@@ -109,8 +112,20 @@ def refresh_fleet(accts, workers=10, only_session=True):
         return a["email"], d
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for fut in as_completed([ex.submit(one, a) for a in ts]):
-            em, d = fut.result(); FLEET["data"][em] = d
+            em, d = fut.result(); _cc_alert(em, d); FLEET["data"][em] = d
     FLEET["ts"] = time.time()
+
+# ── deteksi CC (Canton Coin) reward masuk → alert Telegram ──────────────────
+_CC_SEEN = {}  # email -> total CC terakhir (baseline reward). None-baseline pertama tak memicu alert.
+def _cc_alert(em, d):
+    cc = d.get("cc") or {}
+    tot = cc.get("total", 0.0)
+    prev = _CC_SEEN.get(em)
+    _CC_SEEN[em] = tot
+    if prev is not None and tot > prev + 1e-9:  # naik = reward landing
+        delta = tot - prev
+        LB._tg_send(f"🎁 <b>CC reward masuk</b> <code>{em}</code>\n+{delta:.4f} CC (total {tot:.4f})")
+        logline(f"🎁 CC +{delta:.4f} {em.split('@')[0]}")
 
 # ── render dashboard ───────────────────────────────────────────────────
 def render(accts, sel=0):
@@ -159,7 +174,9 @@ def render(accts, sel=0):
     n = len(ts); verif = sum(1 for a in ts if a.get("credVerified") is True)
     sesok = sum(1 for a in ts if LB.session_valid(a))
     def _sum(k): return sum((FLEET["data"].get(a["email"], {}).get("edelx") or {}).get(k, 0) for a in ts)
+    def _sumcc(k): return sum((FLEET["data"].get(a["email"], {}).get("cc") or {}).get(k, 0) for a in ts)
     edelx_tot = _sum("total"); avail_tot = _sum("available"); locked_tot = _sum("locked"); staked_tot = _sum("staked")
+    cc_tot = _sumcc("total")
     submitted = sum(1 for a in ts if FLEET["data"].get(a["email"], {}).get("round") == "SUBMITTED")
     calls_tot = sum((a.get("stats") or {}).get("submitted", 0) for a in ts)  # total listing call sukses (kumulatif)
     parts = [
@@ -169,6 +186,7 @@ def render(accts, sel=0):
         ("  avail ", C_DIM), (f"{fmt_amt(avail_tot)}", C_OK),
         ("  locked ", C_DIM), (f"{fmt_amt(locked_tot)}", C_WARN),
         ("  staked ", C_DIM), (f"{fmt_amt(staked_tot)}", C_KEY),
+        ("  CC🎁 ", C_DIM), (f"{fmt_amt(cc_tot)}", C_OK),
         ("  SUB ", C_DIM), (f"{submitted}", C_KEY),
         ("  CALLS✓ ", C_DIM), (f"{calls_tot}", C_OK),
     ]
@@ -215,7 +233,7 @@ def render(accts, sel=0):
 
     # panel bawah: DETAIL + LOG akun terpilih
     if n:
-        a = ts[sel]; em = a["email"]; live = FLEET["data"].get(em, {}); e = live.get("edelx") or {}
+        a = ts[sel]; em = a["email"]; live = FLEET["data"].get(em, {}); e = live.get("edelx") or {}; cc = live.get("cc") or {}
         sess = a.get("session") or {}
         exp = sess.get("expires", 0); exp_txt = f"{(exp - time.time())/3600:.1f} jam" if exp > time.time() else "[red]expired[/]"
         d = Table.grid(padding=(0, 2))
@@ -225,6 +243,7 @@ def render(accts, sel=0):
         d.add_row("Email", emlabel, "Verified", "[green]ya[/]" if a.get("credVerified") is True else "[yellow]?[/]")
         d.add_row("EDELx avail", f"[orange1]{e.get('available',0):.2f}[/]", "staked", f"{e.get('staked',0):.2f}")
         d.add_row("locked", f"{e.get('locked',0):.2f}", "total", f"{e.get('total',0):.2f}")
+        d.add_row("CC🎁 avail", f"[green]{cc.get('available',0):.4f}[/]", "CC total", f"[green]{cc.get('total',0):.4f}[/]")
         d.add_row("Round", str(live.get("round") or "—"), "Sesi", exp_txt)
         fase = LB.PHASE_LABEL.get(live.get("phase", "idle"), "?")
         sub_sel = (a.get("stats") or {}).get("submitted", 0)
@@ -551,6 +570,31 @@ def act_send(accts):
     console.print(f"[bold green]selesai: {ok}/{len(res)} transfer sukses[/]")
     questionary.text("enter untuk lanjut").ask()
 
+def act_preapprove(accts):
+    """Aktifkan pre-approval (send SEMUA token + receiving) untuk banyak akun sekaligus."""
+    ts = LB.targets(accts)
+    scope = questionary.select("Aktifkan pre-approval untuk:", choices=[
+        "Semua akun (target)", "Hanya akun sesi valid", "Pilih akun (checkbox)", "Batal"]).ask()
+    if not scope or scope == "Batal": return
+    if scope.startswith("Hanya akun sesi"):
+        pick = [a["email"] for a in ts if LB.session_valid(a)]
+    elif scope.startswith("Pilih"):
+        labels = [a["email"].split("@")[0] for a in ts]
+        chosen = questionary.checkbox("Pilih akun (spasi=pilih, enter=lanjut):", choices=labels).ask()
+        if not chosen: return
+        pick = [ts[labels.index(c)]["email"] for c in chosen]
+    else:
+        pick = [a["email"] for a in ts]
+    recv = questionary.confirm("Sertakan receiving pre-approval juga? (biar bisa TERIMA transfer)", default=True).ask()
+    console.print(f"[orange1]pre-approval SEMUA token untuk {len(pick)} akun (send{'+recv' if recv else ''})…[/]")
+    res = SB.enable_all_preapprovals(accts, emails=pick, recv=bool(recv),
+                                     log=lambda m: (logline(m), console.print(f"[dim]{m}[/]")))
+    ok = sum(1 for _, oks, ns, _ in res if ns and oks == ns)
+    rok = sum(1 for *_, r in res if r)
+    console.print(f"[bold green]selesai: send-preapproval penuh {ok}/{len(res)} akun"
+                  + (f" · receiving {rok}/{len(res)}" if recv else "") + "[/]")
+    questionary.text("enter untuk lanjut").ask()
+
 def act_history(accts):
     live = questionary.confirm("Cek saldo LIVE dari server? (lambat, tapi akurat)", default=True).ask()
     console.print("[dim]menghitung riwayat listing call…[/]")
@@ -571,7 +615,7 @@ def menu():
             choices=["📊 Dashboard live", "➕ Register Akun (HTTP)", "👀 Watcher Kode Telegram",
                      "🍪 Import Akun (cookie ekstensi)",
                      "▶  Jalankan Listing Calls (sekali)",
-                     "🔁 Auto Listing (tiap window)", "💸 Kirim EDELx (bulk)", "🔑 Refresh Sesi",
+                     "🔁 Auto Listing (tiap window)", "💸 Kirim EDELx (bulk)", "🔓 Pre-Approve Semua Token", "🔑 Refresh Sesi",
                      "📈 Riwayat Listing Call", "📋 Status Fleet", "🏦 Party IDs (deposit)", "⏳ Pantau Settlement",
                      pxlabel, "❌ Keluar"],
         ).ask()
@@ -588,6 +632,7 @@ def menu():
         elif choice.startswith("▶"): act_run(accts)
         elif choice.startswith("🔁"): act_auto(accts)
         elif choice.startswith("💸"): act_send(accts)
+        elif choice.startswith("🔓"): act_preapprove(accts)
         elif choice.startswith("🔑"): act_sessions(accts)
         elif choice.startswith("📈"): act_history(accts)
         elif choice.startswith("📋"): act_status(accts)

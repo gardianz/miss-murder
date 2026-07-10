@@ -40,6 +40,47 @@ def ensure_recv_preapproval(acct, log=print):
     st, r = LB.api(acct, "POST", "/transfers/preapproval", {})
     return st in (200, 201, 409)  # 409 = mungkin sudah enabled
 
+def portfolio_instruments(acct):
+    """Semua instrumentId di portfolio akun (EDELx, Amulet/CC, dll)."""
+    st, pf = LB.api(acct, "GET", "/portfolio")
+    if not isinstance(pf, dict): return []
+    return [b["instrumentId"] for b in pf.get("balances", []) if b.get("instrumentId")]
+
+def ensure_send_preapproval_all(acct, instruments=None, log=print):
+    """Enable SENDING preapproval untuk SEMUA instrument (default: semua yg ada di portfolio).
+    Return (jumlah_enabled, jumlah_target)."""
+    st, pa = LB.api(acct, "GET", "/transfers/preapprovals")
+    have = {p.get("instrumentId") for p in (pa.get("preapprovals", []) if isinstance(pa, dict) else [])
+            if p.get("enabled")}
+    if instruments is None:
+        instruments = portfolio_instruments(acct) or [INSTRUMENT]
+    ok = 0
+    for inst in instruments:
+        if inst in have: ok += 1; continue
+        st, r = LB.api(acct, "POST", "/transfers/preapprovals", {"instrumentId": inst})
+        if st in (200, 201): ok += 1
+        else: log(f"  [{acct['email']}] send-preapproval {inst}: {st} {_err(r)}")
+    return ok, len(instruments)
+
+def enable_all_preapprovals(accts, emails=None, recv=True, workers=16, log=print):
+    """Bulk: aktifkan send-preapproval SEMUA token + (opsi) receiving, untuk banyak akun paralel.
+    emails=None → semua target. Return list (email, ok_send, n_send, recv_ok)."""
+    ts = LB.targets(accts)
+    if emails is not None:
+        want = set(emails); ts = [a for a in ts if a["email"] in want]
+    def one(a):
+        if not LB.ensure_session(a, accts):
+            log(f"  [{a['email']}] sesi mati — skip"); return (a["email"], 0, 0, False)
+        oks, ns = ensure_send_preapproval_all(a, log=log)
+        rok = ensure_recv_preapproval(a, log=log) if recv else None
+        log(f"  [{a['email']}] send {oks}/{ns}" + (f" · recv {'ok' if rok else 'x'}" if recv else ""))
+        return (a["email"], oks, ns, rok)
+    out = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for fut in as_completed([ex.submit(one, a) for a in ts]):
+            out.append(fut.result())
+    return out
+
 def transfer(sender, to_party, amount, idem, ref=None, log=print):
     """Satu transfer. Return status: ok | recv_needed | insufficient | send_preapproval | fail."""
     body = {"instrumentId": INSTRUMENT, "amount": f"{amount:.4f}".rstrip("0").rstrip("."),
