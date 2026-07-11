@@ -2,3 +2,4 @@ requests
 cryptography
 rich
 questionary
+telethon
