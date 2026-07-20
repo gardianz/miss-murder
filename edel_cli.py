@@ -504,6 +504,7 @@ def act_send(accts):
     # workers tinggi) — jauh lebih cepat dari refresh_fleet (yg juga hit /listing-round + login massal).
     load_bal = questionary.confirm("Muat saldo EDELx untuk urut sender? (cepat: hanya akun sesi valid)",
                                    default=False).ask()
+    bal = {}   # {email: {available,...}|None} — dipakai lagi utk label/urut picker TUJUAN
     if load_bal:
         relogin = questionary.confirm("Sertakan akun sesi MATI juga? (login massal → LAMBAT/throttle)",
                                       default=False).ask()
@@ -527,7 +528,6 @@ def act_send(accts):
         "Pilih akun tujuan (checkbox interaktif)", "Semua akun lain (auto, skip settlement — LAMBAT)",
         "Party ID eksternal (paste)", "Ketik email manual", "Batal"]).ask()
     if not tmode or tmode == "Batal": return
-    by_prefix = {a["email"].split("@")[0]: a for a in ts}
     if tmode.startswith("Party ID eksternal"):
         raw = questionary.text("Party ID tujuan (pisah koma/spasi/baris; wallet eksternal):").ask() or ""
         import re
@@ -538,10 +538,23 @@ def act_send(accts):
             console.print(f"[dim]{len(targets)} party id eksternal:[/] " + ", ".join(p[:16]+'…' for _, p in targets[:5])
                           + (" …" if len(targets) > 5 else ""))
     elif tmode.startswith("Pilih akun tujuan"):
-        opts = [p for p in by_prefix if by_prefix[p]["email"] not in senders]
-        chosen = questionary.checkbox("Pilih TUJUAN (ketik untuk filter; spasi=pilih):", choices=opts).ask()
+        cands = [a for a in ts if a["email"] not in senders]
+        if not bal:
+            # saldo belum dimuat di tahap sender → muat sekarang biar picker TUJUAN ada saldonya
+            console.print("[dim]memuat saldo tujuan (GET /portfolio, akun sesi valid)…[/]")
+            bal = LB.fetch_balances(accts, workers=48, log=lambda m: console.print(f"[dim]{m}[/]"))
+        def avt(a):
+            v = bal.get(a["email"])
+            return v.get("available", 0.0) if v else 0.0
+        cands.sort(key=avt, reverse=True)  # saldo terbesar di atas; '?' (sesi mati) di bawah
+        labs = []
+        for a in cands:
+            v = bal.get(a["email"])
+            s = f"{v.get('available', 0.0):>10.2f}" if v else f"{'?':>10}"
+            labs.append(f"{a['email'].split('@')[0]:<22} {s} EDELx")
+        chosen = questionary.checkbox("Pilih TUJUAN (ketik untuk filter; spasi=pilih):", choices=labs).ask()
         if not chosen: return
-        targets = [(by_prefix[c]["email"], by_prefix[c]["hostedPartyId"]) for c in chosen]
+        targets = [(cands[labs.index(c)]["email"], cands[labs.index(c)]["hostedPartyId"]) for c in chosen]
     elif tmode.startswith("Semua akun lain"):
         # prioritas saldo kecil/kosong dulu, skip settlement (query per-akun → lambat, tapi user pilih)
         if not FLEET["data"]:
