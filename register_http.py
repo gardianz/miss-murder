@@ -93,20 +93,31 @@ _REG_HDR = {"Accept": "application/json", "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0", "Origin": ORIGIN, "Referer": ORIGIN + "/register"}
 _SHARED = None
 _SHARED_LOCK = threading.Lock()
+_SHARED_ADAPTER = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=0)
 
 def shared_session():
     """Session HTTP bersama dgn connection-pool keep-alive (TLS reuse) — jalur no-proxy FCFS.
-    Hemat handshake TLS ~100-300ms per klaim setelah koneksi warm."""
+    Hemat handshake TLS ~100-300ms per klaim setelah koneksi warm.
+    NB: dipakai utk warm_connections saja. Register per-worker pakai pooled_session()
+    (cookie jar terisolasi) supaya challenge start/finish tak saling clobber antar thread."""
     global _SHARED
     if _SHARED is None:
         with _SHARED_LOCK:
             if _SHARED is None:
                 s = requests.Session()
-                ad = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=0)
-                s.mount("https://", ad); s.mount("http://", ad)
+                s.mount("https://", _SHARED_ADAPTER); s.mount("http://", _SHARED_ADAPTER)
                 s.headers.update(_REG_HDR)
                 _SHARED = s
     return _SHARED
+
+def pooled_session():
+    """Session baru dgn cookie jar sendiri TAPI berbagi connection-pool (_SHARED_ADAPTER).
+    Isolasi cookie = tiap worker punya sesi WebAuthn sendiri (challenge start->finish tak
+    tertimpa worker lain). TLS pool tetap dipakai bersama = tak handshake ulang."""
+    s = requests.Session()
+    s.mount("https://", _SHARED_ADAPTER); s.mount("http://", _SHARED_ADAPTER)
+    s.headers.update(_REG_HDR)
+    return s
 
 def warm_connections(n=8, log=None):
     """Pre-open n koneksi TLS keep-alive ke server (isi pool) biar wave pertama tak handshake."""
@@ -119,9 +130,9 @@ def warm_connections(n=8, log=None):
     if log: log(f"[warm] {n} koneksi TLS keep-alive siap")
 
 def register_one(email, display, proxy, tries=6, access_code=None):
-    use_shared = NO_PROXY or not proxy       # no-proxy → session warm bersama (TLS keep-alive)
+    use_shared = NO_PROXY or not proxy       # no-proxy → pooled session (TLS reuse, cookie terisolasi)
     if use_shared:
-        s = shared_session(); proxies = None
+        s = pooled_session(); proxies = None
     else:
         s = requests.Session()
         s.headers.update(_REG_HDR)
@@ -172,8 +183,8 @@ def register_one(email, display, proxy, tries=6, access_code=None):
         "authenticatorAttachment": "platform"}}
     # 3) finish
     r = post("/auth/register/finish", body)
-    if not r or r.status_code not in (200, 201):
-        why = f"finish {r.status_code if r else 'ERR'} {r.text[:100] if r else last_err['v']}"
+    if r is None or r.status_code not in (200, 201):   # NB: bool(Response) False utk 4xx → cek 'is None'
+        why = f"finish {r.status_code if r is not None else 'ERR'} {r.text[:120] if r is not None else last_err['v']}"
         return {"ok": False, "email": email, "why": why}
     prof = r.json().get("profile", {})
     return {
